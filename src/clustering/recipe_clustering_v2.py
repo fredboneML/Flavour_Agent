@@ -11,6 +11,17 @@ Improvements over V1:
     * Totalmenge            scales each ingredient's contribution by its share
     * Threshold ppm         scales by odour potency (1 / threshold)
   → combined term weight = positional_weight × totalmenge × (1 / threshold)
+
+  The positional_weight is the same base multiplier for both Sensorik and
+  Odour Type columns — what differs is the n_cols used in the formula:
+      pos_weight(position, n_cols) = (n_cols + 1 - position) / n_cols
+  Sensorik (n_cols=4): pos 1→1.00, pos 2→0.75, pos 3→0.50, pos 4→0.25
+  Odour Type (n_cols=3): pos 1→1.00, pos 2→0.67, pos 3→0.33
+
+  Sensorik and Odour Type terms share the same vocabulary (feature space).
+  If the same term appears in both a Sensorik column and an Odour Type column
+  for the same ingredient, both positional weights are added to the same
+  vector dimension — so overlap reinforces that term's importance.
 - Rows with Totalmenge = 0 are excluded from vector building
 """
 

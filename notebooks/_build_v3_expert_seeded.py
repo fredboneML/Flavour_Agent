@@ -4,7 +4,7 @@ This is a notebook-generation script. It writes
 recipe_clustering_erdbeere_mds_all_algorithms_v3_expert_seeded.ipynb
 based on the v2 notebook structure but with:
   - K fixed at 7 (from the expert Vorgabe.xlsx)
-  - 3 centroid-seeding strategies x all algorithms
+  - 6 centroid-seeding strategies + 3 direct methods x all algorithms
 
 Run from project root:
     python notebooks/_build_v3_expert_seeded.py
@@ -41,10 +41,10 @@ This notebook mirrors the v2 *all algorithms / no threshold* notebook with one
 key change: the **number of clusters and their centroids are seeded from
 expert knowledge** in `data/gold/Erdbeer Clustering Sensorik Vorgabe.xlsx`.
 
-The aim is to evaluate three different ways of building seed centroids and to
+The aim is to evaluate six different ways of building seed centroids and to
 compare how each clustering algorithm responds to that seeding.
 
-## Five centroid strategies
+## Six centroid strategies
 
 | Strategy | Seed source | Aggregation | Floral fallback |
 |---|---|---|---|
@@ -53,10 +53,17 @@ compare how each clustering algorithm responds to that seeding.
 | **S3 - Hybrid** | Target Recipes where available; ingredient-based for floral | mean | ingredient (Jasmin-Absolue) |
 | **S4 - Target Recipes (median)** | same source as S1 | element-wise median | OT1-dominant fallback, median |
 | **S5 - Ingredients (median)** | same source as S2 | element-wise median | ingredient (Jasmin-Absolue), median |
+| **S6 - Contrast (Rocchio)** | same source as S1 | mean(seed) − 0.5·mean(rest) | OT1-dominant fallback, then contrast |
 
 S4 and S5 mirror S1 and S2 exactly except for the aggregation. The median is
 more robust to outlier recipes (e.g. recipes dominated by a single
 descriptor) and tends to produce sparser centroids on this 13-d OT1 space.
+
+S6 keeps S1's seed source but subtracts the global background profile
+(β=0.5·mean of all non-seed recipes), so each centroid emphasizes what
+*distinguishes* its cluster rather than the shared fruity/sweet character that
+dominates every recipe. Negative components are clipped to keep the centroid a
+valid non-negative OT1 profile.
 
 ## Expert clusters (k=7)
 `warm, floral, Walderdbeere, green, dairy, unpleasant, fruity`
@@ -296,10 +303,10 @@ if unmatched:
 """))
 
 # ---------------------------------------------------------------------------
-# 5. Three centroid strategies
+# 5. Six centroid strategies
 # ---------------------------------------------------------------------------
 CELLS.append(md(
-    """## 5. Build Three Centroid Strategies
+    """## 5. Build Six Centroid Strategies
 
 Each strategy returns a dict `{cluster_name → centroid_vector}` in the same
 OT1 vocabulary space as the recipe vectors. Centroids are L2-normalized so
@@ -411,12 +418,44 @@ def build_strategy_ingredients_median(expert_spec, vectors, recipes, df):
         centroids[cname] = _median_of_indices(idxs, vectors)
     return centroids
 
+# ── Strategy 6: Contrast (Rocchio) centroids ─────────────────────────────────
+# centroid = normalize( mean(seed) - BETA * mean(all recipes NOT in seed) ).
+# Subtracting the global "fruity/sweet" background that dominates OT1 space
+# sharpens what *distinguishes* each cluster. Seed source = S1 target recipes
+# (so S1 vs S6 isolates the contrast effect).
+CONTRAST_BETA = 0.5
+
+def build_strategy_contrast(expert_spec, vectors, recipes, vocab_to_idx, beta=CONTRAST_BETA):
+    centroids = {}
+    n_all = vectors.shape[0]
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        resolved = s.get('target_recipes_resolved', [])
+        idxs = [recipes.index(r) for r in resolved if r in recipes]
+        if not idxs:
+            fallback_term = cname.lower()
+            idxs = _ot1_dominant_recipes(fallback_term, vectors, vocab_to_idx, top_n=5)
+            print(f'  [S6] {cname}: no targets, OT1-dominant fallback on "{fallback_term}" → {len(idxs)} recipes (contrast)')
+        if not idxs:
+            centroids[cname] = None
+            continue
+        in_mean  = vectors[idxs].mean(axis=0)
+        out_idxs = [i for i in range(n_all) if i not in set(idxs)]
+        out_mean = vectors[out_idxs].mean(axis=0) if out_idxs else np.zeros_like(in_mean)
+        c = in_mean - beta * out_mean
+        c = np.clip(c, 0.0, None)  # keep non-negative so it stays a valid profile in OT1 space
+        if np.linalg.norm(c) < 1e-12:
+            c = in_mean  # contrast wiped everything out → fall back to the plain mean
+        centroids[cname] = _normalize_vec(c)
+    return centroids
+
 STRATEGIES = {
     'S1_target_recipes':        build_strategy_target_recipes(expert_spec, vecs, recipes, vocab_to_idx),
     'S2_ingredients':           build_strategy_ingredients(expert_spec, vecs, recipes, df),
     'S3_hybrid':                build_strategy_hybrid(expert_spec, vecs, recipes, df),
     'S4_target_recipes_median': build_strategy_target_recipes_median(expert_spec, vecs, recipes, vocab_to_idx),
     'S5_ingredients_median':    build_strategy_ingredients_median(expert_spec, vecs, recipes, df),
+    'S6_contrast':              build_strategy_contrast(expert_spec, vecs, recipes, vocab_to_idx),
 }
 
 # Validate: every strategy must have all 7 centroids
@@ -718,6 +757,182 @@ for s_name, c_dict in STRATEGIES.items():
 """))
 
 # ---------------------------------------------------------------------------
+# 7b. Direct methods (M1 label-prop, M2 rule-based, M3 consensus)
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 7b. Direct Methods (Family B)
+
+Three methods that do **not** fit the "build centroid -> run 10 algorithms"
+grid. Each produces a single labeling, collected in `direct_results`:
+
+- **M1 - Label Propagation**: kNN cosine graph over all recipes; expert target
+  recipes are pinned to their cluster and labels diffuse through the manifold.
+  Clusters with no Target Recipe are seeded from a few ingredient recipes.
+- **M2 - Rule-based pre-assignment**: the expert `Regeln/ Notizen` rules,
+  transcribed in full and applied on per-recipe Totalmenge-normalized CAS
+  concentrations. Recipes that fire no rule fall back to the nearest S1 centroid.
+- **M3 - Consensus**: co-association across all Family-A algorithm runs
+  (excluding the degenerate DEC / Fuzzy c-Means) plus M1, clustered at k=7.
+"""))
+
+# ── M1: Label Propagation ────────────────────────────────────────────────────
+CELLS.append(code(
+    """from sklearn.semi_supervised import LabelSpreading
+
+direct_results = {}
+
+cluster_to_int = {c: i for i, c in enumerate(EXPERT_CLUSTERS)}
+int_to_cluster = {i: c for c, i in cluster_to_int.items()}
+
+# Seed labels: target recipes pinned; clusters with no target seeded from a few
+# ingredient recipes (hybrid-style) so every expert cluster can be propagated.
+seed_labels = np.full(len(recipes), -1, dtype=int)
+for cname in EXPERT_CLUSTERS:
+    s = expert_spec.get(cname, {})
+    resolved = [r for r in s.get('target_recipes_resolved', []) if r in recipes]
+    if not resolved:
+        idxs = _recipes_containing_cas(s.get('cas', []), df, recipes)
+        resolved = [recipes[i] for i in idxs[:3]]
+        if resolved:
+            print(f'  [M1] {cname}: no targets, seeding from {len(resolved)} ingredient recipes')
+    for r in resolved:
+        seed_labels[recipes.index(r)] = cluster_to_int[cname]
+
+n_seeded = int((seed_labels >= 0).sum())
+seeded_clusters = sorted({int_to_cluster[i] for i in seed_labels if i >= 0})
+missing = [c for c in EXPERT_CLUSTERS if c not in seeded_clusters]
+print(f'M1 Label Propagation: {n_seeded} seeded recipes across {len(seeded_clusters)} clusters')
+if missing:
+    print(f'  ⚠ no seed for: {missing} — these clusters cannot be propagated')
+
+# vecs are L2-normalized, so kNN ordering matches cosine similarity.
+ls = LabelSpreading(kernel='knn', n_neighbors=10, alpha=0.2, max_iter=1000)
+ls.fit(vecs, seed_labels)
+direct_results['M1_label_prop'] = np.array([int_to_cluster[i] for i in ls.transduction_])
+print('  sizes:', {c: int((direct_results['M1_label_prop'] == c).sum()) for c in EXPERT_CLUSTERS})
+"""))
+
+# ── M2: Rule-based pre-assignment (full interpretation) ──────────────────────
+CELLS.append(code(
+    """# Expert rules transcribed in full from the 'Regeln/ Notizen' column of
+# Erdbeer Clustering Sensorik Vorgabe.xlsx. conc = per-recipe Totalmenge-
+# normalized amount of the marker CAS in that recipe.
+#   mode 'threshold' : marker conc > thr        (rule text '> X eindeutig')
+#   mode 'all'       : ALL markers present > 0   ('alle drei' / 'beide ... müssen')
+#   mode 'any'       : ANY marker present > 0    ('wenn Rohstoff vorhanden')
+# tier = precedence (1 strongest). 'green' and 'unpleasant/Hexansäure' carry
+# 'keine eindeutige Regel gefunden' -> no rule, centroid fallback only.
+RULES = [
+    # tier 1 — 'eindeutig' concentration thresholds
+    {'cluster': 'unpleasant', 'mode': 'threshold', 'cas': ['75-18-3'],   'thr': 0.0009, 'tier': 1, 'note': 'Dimethylsulfid >0.0009 eindeutig'},
+    {'cluster': 'fruity',     'mode': 'threshold', 'cas': ['3025-30-7'], 'thr': 0.004,  'tier': 1, 'note': 'Ethyl-2,4-decadienoat >0.004 eindeutig'},
+    {'cluster': 'fruity',     'mode': 'threshold', 'cas': ['123-92-2'],  'thr': 0.1,    'tier': 1, 'note': 'Isoamylacetat >0.1 eindeutig'},
+    # tier 2 — multi-ingredient AND rules
+    {'cluster': 'warm',         'mode': 'all', 'cas': ['118-71-8', '3658-77-3', '121-33-5'], 'tier': 2, 'note': 'maltol+Furaneol+Vanillin (alle drei)'},
+    {'cluster': 'Walderdbeere', 'mode': 'all', 'cas': ['134-20-3', '85-91-6'],              'tier': 2, 'note': 'Methyl-+Dimethylanthranilat (beide)'},
+    {'cluster': 'dairy',        'mode': 'all', 'cas': ['431-03-8', '513-86-0'],             'tier': 2, 'note': 'diacetyl+Acetoin (beide)'},
+    # tier 3 — single-presence rules ('wenn Rohstoff vorhanden')
+    {'cluster': 'floral',     'mode': 'any', 'cas': ['8022-96-6'],               'tier': 3, 'note': 'Jasmin-Absolue vorhanden'},
+    {'cluster': 'warm',       'mode': 'any', 'cas': ['25152-84-5'],              'tier': 3, 'note': 'trans,trans-2,4-Decadienal vorhanden'},
+    {'cluster': 'unpleasant', 'mode': 'any', 'cas': ['2432-51-1', '13532-18-8'], 'tier': 3, 'note': 'S-Methylthio-butyrat/-propionat vorhanden (Black List)'},
+]
+
+# Precompute per-recipe normalized concentration for every marker CAS.
+_marker_cas = {c for rule in RULES for c in rule['cas']}
+_conc = {}
+for cas in _marker_cas:
+    sub = df[df[CAS_COL].astype(str).str.strip() == cas]
+    _conc[cas] = sub.groupby(REZ_COL)[TOTAL_COL].sum().to_dict()
+
+def C(recipe, cas):
+    return _conc.get(cas, {}).get(recipe, 0.0)
+
+def fired_rules(recipe):
+    out = []
+    for rule in RULES:
+        cas = rule['cas']
+        if rule['mode'] == 'threshold':
+            ok = C(recipe, cas[0]) > rule['thr']
+        elif rule['mode'] == 'all':
+            ok = all(C(recipe, c) > 0 for c in cas)
+        else:  # 'any'
+            ok = any(C(recipe, c) > 0 for c in cas)
+        if ok:
+            out.append(rule)
+    return out
+
+s1_centroids = STRATEGIES['S1_target_recipes']
+m2_labels, audit = [], []
+for ri, recipe in enumerate(recipes):
+    fired = fired_rules(recipe)
+    if fired:
+        best_tier = min(r['tier'] for r in fired)
+        cands = [r for r in fired if r['tier'] == best_tier]
+        cand_clusters = sorted({r['cluster'] for r in cands})
+        if len(cand_clusters) == 1:
+            chosen = cand_clusters[0]
+            reason = cands[0]['note']
+        else:
+            v = vecs[ri]
+            sims = {c: (float(v @ s1_centroids[c]) if s1_centroids.get(c) is not None else -1.0)
+                    for c in cand_clusters}
+            chosen = max(sims, key=sims.get)
+            reason = f"tie@tier{best_tier} {cand_clusters} -> {chosen} (cosine)"
+        m2_labels.append(chosen)
+        audit.append((recipe, f'tier{best_tier}', chosen, reason))
+    else:
+        v = vecs[ri]
+        sims = {c: float(v @ cv) for c, cv in s1_centroids.items() if cv is not None}
+        chosen = max(sims, key=sims.get)
+        m2_labels.append(chosen)
+        audit.append((recipe, 'centroid', chosen, 'no rule fired'))
+
+direct_results['M2_rule_based'] = np.array(m2_labels)
+n_rule = sum(1 for a in audit if a[1] != 'centroid')
+print(f'M2 Rule-based: {n_rule}/{len(recipes)} assigned by rule, {len(recipes)-n_rule} by nearest centroid')
+print('  sizes:', {c: int((direct_results['M2_rule_based'] == c).sum()) for c in EXPERT_CLUSTERS})
+print('\\n  Audit — recipes assigned by an expert rule:')
+for recipe, src, cl, reason in audit:
+    if src != 'centroid':
+        print(f'    {recipe:12s}  [{src}]  -> {cl:14s}  ({reason})')
+"""))
+
+# ── M3: Consensus clustering ─────────────────────────────────────────────────
+CELLS.append(code(
+    """from sklearn.cluster import AgglomerativeClustering
+
+DEGENERATE = {'DEC (simpl.)', 'Fuzzy c-Means'}  # collapsed in v3 — excluded from consensus
+
+label_vectors = []
+for s_name, algo_dict in results.items():
+    for algo, lbl in algo_dict.items():
+        if lbl is None or algo in DEGENERATE:
+            continue
+        label_vectors.append(np.asarray(lbl))
+label_vectors.append(direct_results['M1_label_prop'])
+
+M = len(label_vectors)
+N = len(recipes)
+co = np.zeros((N, N), dtype=np.float64)
+for lbl in label_vectors:
+    same = (lbl[:, None] == lbl[None, :]).astype(np.float64)
+    co += same
+co /= max(M, 1)
+
+d = 1.0 - co
+np.fill_diagonal(d, 0.0)
+agg = AgglomerativeClustering(n_clusters=K_EXPERT, metric='precomputed', linkage='average')
+m3_int = agg.fit_predict(d)
+
+# Re-label integer consensus clusters to expert names via Hungarian on S1 centroids.
+cmat, cnames = centroids_to_matrix(STRATEGIES['S1_target_recipes'], EXPERT_CLUSTERS)
+direct_results['M3_consensus'] = hungarian_align(m3_int, vecs, cmat, cnames)
+print(f'M3 Consensus over {M} label vectors (excluded: {sorted(DEGENERATE)})')
+print('  sizes:', {c: int((direct_results['M3_consensus'] == c).sum())
+                   for c in sorted(set(direct_results['M3_consensus']))})
+"""))
+
+# ---------------------------------------------------------------------------
 # 8-10. Plot each strategy
 # ---------------------------------------------------------------------------
 CELLS.append(md(
@@ -843,13 +1058,22 @@ CELLS.append(code(
 )
 """))
 
+CELLS.append(md("## 11d. Strategy 6 - Contrast (Rocchio) centroids\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S6: Contrast (Rocchio)',
+    results['S6_contrast'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S6_contrast_mds.png',
+)
+"""))
+
 # ---------------------------------------------------------------------------
 # 11. Cross-strategy agreement
 # ---------------------------------------------------------------------------
 CELLS.append(md(
     """## 12. Cross-Strategy Cluster Agreement
 
-For each algorithm, how stable is the partition across the five strategies?
+For each algorithm, how stable is the partition across the six strategies?
 Higher ARI / NMI means the choice of seeding strategy matters less for that
 algorithm. Lower values mean the algorithm is sensitive to seed centroids.
 
@@ -884,6 +1108,28 @@ for algo in algos:
 agreement_df = pd.DataFrame(rows)
 print('Cross-strategy agreement per algorithm:')
 print(agreement_df.to_string(index=False))
+
+# Strategy representatives: Family-A strategies via NearestCentroid (purest
+# 'closest expert centroid' assignment), direct methods M1-M3 as-is. These are
+# the columns the experts compare in the Strategy_Comparison sheet.
+representative = {s_name: algo_dict['NearestCentroid']
+                  for s_name, algo_dict in results.items()
+                  if algo_dict.get('NearestCentroid') is not None}
+for m_name, lbl in direct_results.items():
+    representative[m_name] = lbl
+
+rep_names = list(representative.keys())
+rep_rows = []
+for s_a, s_b in combinations(rep_names, 2):
+    la, lb = representative[s_a], representative[s_b]
+    rep_rows.append({
+        'Strategy A': s_a, 'Strategy B': s_b,
+        'ARI': round(adjusted_rand_score(la, lb), 3),
+        'NMI': round(normalized_mutual_info_score(la, lb), 3),
+    })
+rep_agreement_df = pd.DataFrame(rep_rows)
+print('\\nPairwise agreement across strategy representatives:')
+print(rep_agreement_df.to_string(index=False))
 """))
 
 # ---------------------------------------------------------------------------
@@ -892,15 +1138,44 @@ print(agreement_df.to_string(index=False))
 CELLS.append(md(
     """## 13. Export Cluster Assignments to Excel
 
-One sheet per strategy. Each row is an algorithm; each column is an expert
-cluster (`Cluster_warm`, `Cluster_floral`, ...) listing the recipes assigned
-to it, newline-separated. An `Agreement` sheet holds the ARI / NMI table.
+The first sheet, **`Strategy_Comparison`**, is the expert hand-over view: one
+row per recipe, one column per strategy/method. Family-A strategies (S1–S6) are
+represented by their **NearestCentroid** assignment; the direct methods
+(M1–M3) appear as their own columns. `Target_Recipe?` and
+`Expert_Intended_Cluster` flag the expert's seed recipes so you can see where
+each one landed under every strategy.
+
+Per-strategy detail sheets follow (algorithm rows × cluster columns of recipe
+ids), then one sheet per direct method, then two agreement sheets
+(`Agreement_Strategies` = pairwise ARI/NMI across strategy representatives,
+`Agreement_byAlgo` = per-algorithm cross-strategy stability).
 """))
 
 CELLS.append(code(
     """out_xlsx = f'{OUTPUT_DIR}/cluster_assignments_expert_seeded_all_strategies.xlsx'
 
+# Map each resolved Target Recipe to the cluster the expert intended for it.
+target_to_cluster = {}
+for cname, sp in expert_spec.items():
+    for r in sp.get('target_recipes_resolved', []):
+        target_to_cluster[r] = cname
+
 with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
+    # Master expert-review sheet: one row per recipe, one column per strategy.
+    # Family-A strategies represented by NearestCentroid; direct methods as-is.
+    master_rows = []
+    for ri, recipe in enumerate(recipes):
+        row = {
+            'Recipe': recipe,
+            'Target_Recipe?': 'yes' if recipe in target_to_cluster else '',
+            'Expert_Intended_Cluster': target_to_cluster.get(recipe, ''),
+        }
+        for col_name, lbl in representative.items():
+            row[col_name] = lbl[ri]
+        master_rows.append(row)
+    pd.DataFrame(master_rows).to_excel(writer, sheet_name='Strategy_Comparison', index=False)
+
+    # Per-strategy detail sheets (Family A: algorithm rows x cluster columns).
     for s_name, algo_dict in results.items():
         rows = []
         for algo, lbl in algo_dict.items():
@@ -908,27 +1183,32 @@ with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
                 rows.append({'Algorithm': algo})
                 continue
             row = {'Algorithm': algo}
-            uniq = sorted(set(lbl))
-            for cname in uniq:
+            for cname in sorted(set(lbl)):
                 mask = lbl == cname
-                rec_list = sorted(np.array(recipes)[mask].tolist())
-                row[f'Cluster_{cname}'] = '\\n'.join(rec_list)
+                row[f'Cluster_{cname}'] = '\\n'.join(sorted(np.array(recipes)[mask].tolist()))
             rows.append(row)
-        sheet_df = pd.DataFrame(rows).fillna('')
-        sheet_df.to_excel(writer, sheet_name=s_name[:31], index=False)
-    agreement_df.to_excel(writer, sheet_name='Agreement', index=False)
+        pd.DataFrame(rows).fillna('').to_excel(writer, sheet_name=s_name[:31], index=False)
+
+    # Direct-method detail sheets (single row each).
+    for m_name, lbl in direct_results.items():
+        row = {'Method': m_name}
+        for cname in sorted(set(lbl)):
+            mask = lbl == cname
+            row[f'Cluster_{cname}'] = '\\n'.join(sorted(np.array(recipes)[mask].tolist()))
+        pd.DataFrame([row]).fillna('').to_excel(writer, sheet_name=m_name[:31], index=False)
+
+    # Agreement sheets.
+    rep_agreement_df.to_excel(writer, sheet_name='Agreement_Strategies', index=False)
+    agreement_df.to_excel(writer, sheet_name='Agreement_byAlgo', index=False)
 
 print(f'Exported: {out_xlsx}')
+print(f'  Sheets: Strategy_Comparison + {len(results)} strategy + {len(direct_results)} direct + 2 agreement')
 
-# Print a per-cluster count summary across strategies
-print('\\nCluster sizes per algorithm × strategy:')
-for s_name, algo_dict in results.items():
-    print(f'\\n── {s_name} ──')
-    for algo, lbl in algo_dict.items():
-        if lbl is None:
-            print(f'  {algo:18s}  N/A'); continue
-        sizes = {c: int((lbl == c).sum()) for c in sorted(set(lbl))}
-        print(f'  {algo:18s}  {sizes}')
+# Per-cluster count summary across strategy representatives.
+print('\\nCluster sizes per strategy representative:')
+for col_name, lbl in representative.items():
+    sizes = {c: int((lbl == c).sum()) for c in sorted(set(lbl))}
+    print(f'  {col_name:26s}  {sizes}')
 """))
 
 # ---------------------------------------------------------------------------
@@ -941,11 +1221,11 @@ CELLS.append(md(
   either by direct centroid seeding (K-Means, GMM, K-Medoids, Fuzzy c-Means,
   SOM, DEC, NearestCentroid) or by Hungarian re-labeling (Ward, DBSCAN,
   HDBSCAN, Spectral).
-- The cross-strategy ARI/NMI table in section 12 ranks algorithms by how
-  much they care about the choice of seed centroid - higher = less sensitive.
-- For interpretation, inspect the Excel export side-by-side with the
-  expert's `Target Recipes` column - any cluster where the Target Recipes
-  end up in different algorithm clusters is a candidate for closer review.
+- The cross-strategy ARI/NMI table ranks algorithms by how much they care
+  about the choice of seed centroid - higher = less sensitive.
+- **For expert hand-over**, the `Strategy_Comparison` sheet is the place to
+  start: scan each recipe across all strategy columns and tell us which column
+  best matches the panelists' free-sorting groups.
 
 Outputs written:
 
@@ -954,7 +1234,30 @@ Outputs written:
 - `outputs/erdbeere_v3_S3_hybrid_mds.png`
 - `outputs/erdbeere_v3_S4_target_recipes_median_mds.png`
 - `outputs/erdbeere_v3_S5_ingredients_median_mds.png`
-- `outputs/cluster_assignments_expert_seeded_all_strategies.xlsx` (5 strategy sheets + Agreement)
+- `outputs/erdbeere_v3_S6_contrast_mds.png`
+- `outputs/cluster_assignments_expert_seeded_all_strategies.xlsx`
+  (Strategy_Comparison + 6 strategy + 3 direct-method + 2 agreement sheets)
+"""))
+
+# ---------------------------------------------------------------------------
+# 15. Next strategies to try
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 15. Next Strategies to Try
+
+Not yet implemented — candidate directions for the next iteration, ordered
+roughly by expected payoff / effort.
+
+| # | Idea | Why it might help |
+|---|------|-------------------|
+| 1 | **Direct ingredient-profile centroid** | Average the OT1 vectors of the expert *ingredients themselves* (not the recipes containing them), giving a pure prototype uncontaminated by everything else in those recipes. |
+| 2 | **Medoid centroid** | Use the real target recipe closest to the group mean as the centroid — stays on the data manifold; robust when a cluster has only 2–3 targets and one is an outlier. |
+| 3 | **Dose-weighted mean** | Weight each seed recipe by how much of the signature ingredient it contains, so a recipe at 8 % counts more than a trace. |
+| 4 | **Constrained k-means (COP/PCKMeans)** | Must-link among same-cluster targets, cannot-link across clusters — cluster freely but never violate expert judgments. |
+| 5 | **Few-shot classifier** | With fixed named clusters + labeled targets this is really classification: kNN / nearest-shrunken-centroid / logistic regression on the labeled targets. |
+| 6 | **Supervised metric learning / LDA** | Learn a transform of OT1 space (LDA, NCA, LMNN) that pulls same-cluster targets together, then run the 10 algorithms in the learned space. Fixes the root cause if expert clusters aren't separable under plain cosine. |
+| 7 | **Seeded soft GMM** | Freeze component means at expert centroids and return soft memberships ("60 % Grün, 40 % Frucht-Süß") — closer to how panelists perceive borderline recipes. |
+| 8 | **Active-disagreement report** | Rank recipes by how much the strategies disagree and hand that shortlist back to the experts — cheapest way to get more labels exactly where they matter. |
 """))
 
 

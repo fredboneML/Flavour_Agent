@@ -1232,6 +1232,117 @@ for col_name, lbl in representative.items():
 """))
 
 # ---------------------------------------------------------------------------
+# 13b. Strategy_Comparison overview plots
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 13b. Strategy_Comparison Overview (at a glance)
+
+Four panels summarising the `Strategy_Comparison` sheet so the whole picture
+is visible without scrolling 130 rows:
+
+1. **Pairwise agreement (ARI)** - which strategies produce similar partitions.
+2. **Cluster-size composition** - which strategies keep balanced clusters vs
+   collapse everything into a few.
+3. **Target-recipe recovery** - for each of the expert's seed recipes, where it
+   lands under every strategy (✓ = matches the expert-intended cluster).
+4. **Per-recipe consensus** - on the MDS map, how many strategies agree on each
+   recipe (bright = unanimous, dark = contested); expert targets ringed in red.
+"""))
+
+CELLS.append(code(
+    """from matplotlib.colors import ListedColormap
+
+strat_cols  = list(representative.keys())
+short       = lambda nm: nm.split('_')[0]
+short_names = [short(s) for s in strat_cols]
+labels_mat  = {k: np.asarray(v) for k, v in representative.items()}
+nS, N = len(strat_cols), len(recipes)
+ci    = {c: i for i, c in enumerate(EXPERT_CLUSTERS)}
+cmap7 = ListedColormap([EXPERT_COLORS[c] for c in EXPERT_CLUSTERS])
+ridx  = {r: i for i, r in enumerate(recipes)}
+
+fig, axes = plt.subplots(2, 2, figsize=(20, 17))
+
+# ── Panel 1: pairwise ARI agreement heatmap ──
+ax = axes[0, 0]
+ari = np.eye(nS)
+for a in range(nS):
+    for b in range(a + 1, nS):
+        v = adjusted_rand_score(labels_mat[strat_cols[a]], labels_mat[strat_cols[b]])
+        ari[a, b] = ari[b, a] = v
+im = ax.imshow(ari, cmap='RdYlGn', vmin=0, vmax=1)
+ax.set_xticks(range(nS)); ax.set_xticklabels(short_names, rotation=45, ha='right')
+ax.set_yticks(range(nS)); ax.set_yticklabels(short_names)
+for a in range(nS):
+    for b in range(nS):
+        ax.text(b, a, f'{ari[a, b]:.2f}', ha='center', va='center', fontsize=8)
+ax.set_title('Pairwise strategy agreement (Adjusted Rand Index)\\nhigher = more similar partitions',
+             fontweight='bold')
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+# ── Panel 2: cluster-size composition (stacked bars) ──
+ax = axes[0, 1]
+bottom = np.zeros(nS)
+for c in EXPERT_CLUSTERS:
+    vals = np.array([int((labels_mat[k] == c).sum()) for k in strat_cols])
+    ax.bar(range(nS), vals, bottom=bottom, color=EXPERT_COLORS[c],
+           label=c, edgecolor='white', linewidth=0.5)
+    bottom += vals
+ax.set_xticks(range(nS)); ax.set_xticklabels(short_names, rotation=45, ha='right')
+ax.set_ylabel('recipes')
+ax.set_title(f'Cluster-size composition per strategy (n={N})\\nbalanced vs collapsed clusters at a glance',
+             fontweight='bold')
+ax.legend(fontsize=8, ncol=2, loc='upper right')
+
+# ── Panel 3: target-recipe recovery grid ──
+ax = axes[1, 0]
+targets = sorted(target_to_cluster, key=lambda r: (ci[target_to_cluster[r]], r))
+T = len(targets)
+mat = np.array([[ci.get(labels_mat[k][ridx[r]], 0) for k in strat_cols] for r in targets])
+ax.imshow(mat, cmap=cmap7, vmin=0, vmax=len(EXPERT_CLUSTERS) - 1, aspect='auto')
+ax.set_xticks(range(nS)); ax.set_xticklabels(short_names, rotation=45, ha='right')
+ax.set_yticks(range(T))
+ax.set_yticklabels([f'{r}  [{target_to_cluster[r]}]' for r in targets], fontsize=8)
+for ti, r in enumerate(targets):
+    for si, k in enumerate(strat_cols):
+        if labels_mat[k][ridx[r]] == target_to_cluster[r]:
+            ax.text(si, ti, '✓', ha='center', va='center', fontsize=11,
+                    fontweight='bold', color='white')
+ax.set_title('Target-recipe recovery: where each expert seed recipe lands\\n'
+             '✓ = matches expert-intended cluster; cell colour = assigned cluster',
+             fontweight='bold')
+
+# ── Panel 4: per-recipe consensus on the MDS map ──
+ax = axes[1, 1]
+alllab = np.array([labels_mat[k] for k in strat_cols])
+agreement = np.array([np.unique(alllab[:, j], return_counts=True)[1].max() / nS for j in range(N)])
+sc = ax.scatter(mds_coords[:, 0], mds_coords[:, 1], c=agreement, cmap='viridis',
+                vmin=1.0 / nS, vmax=1.0, s=35, edgecolor='white', linewidth=0.3)
+tmask = np.array([recipes[i] in target_to_cluster for i in range(N)])
+ax.scatter(mds_coords[tmask, 0], mds_coords[tmask, 1], s=140, facecolors='none',
+           edgecolors='red', linewidths=1.6, label='target recipes')
+ax.set_title('Cross-strategy consensus per recipe (MDS)\\nbright = strategies agree, dark = contested',
+             fontweight='bold')
+ax.legend(fontsize=8, loc='best')
+fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04, label='fraction of strategies agreeing')
+
+fig.suptitle('Strategy_Comparison overview - Erdbeere expert-seeded clustering',
+             fontsize=16, fontweight='bold', y=1.01)
+plt.tight_layout()
+_ov = f'{OUTPUT_DIR}/erdbeere_v3_strategy_comparison_overview.png'
+plt.savefig(_ov, dpi=150, bbox_inches='tight')
+plt.show()
+print('Saved overview:', _ov)
+
+unanimous = int((agreement == 1.0).sum())
+print(f'Recipes with unanimous assignment across all {nS} strategies: {unanimous}/{N}')
+print('Target-recipe recovery rate per strategy (matches / {} targets):'.format(T))
+for k in strat_cols:
+    hit = sum(1 for r in targets if labels_mat[k][ridx[r]] == target_to_cluster[r])
+    print(f'  {short(k):4s}  {hit}/{T}')
+"""))
+
+# ---------------------------------------------------------------------------
 # 13. Quick takeaways
 # ---------------------------------------------------------------------------
 CELLS.append(md(
@@ -1256,6 +1367,7 @@ Outputs written:
 - `outputs/erdbeere_v3_S5_ingredients_median_mds.png`
 - `outputs/erdbeere_v3_S6_contrast_mds.png`
 - `outputs/erdbeere_v3_direct_methods_mds.png`
+- `outputs/erdbeere_v3_strategy_comparison_overview.png`
 - `outputs/cluster_assignments_expert_seeded_all_strategies.xlsx`
   (Strategy_Comparison + 6 strategy + 3 direct-method + 2 agreement sheets)
 """))

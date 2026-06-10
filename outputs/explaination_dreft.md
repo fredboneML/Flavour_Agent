@@ -23,6 +23,15 @@ Die letzten drei sind grundsätzlich andere Ansätze:
 
 Eine erste Beobachtung, die eure Einschätzung gut gebrauchen könnte: Mehrere „warm“-Vorgabe-Rezepte (185.237, 187.800, 187.916) landen bei der reinen Centroid-Nähe im Cluster unpleasant, werden aber von der regelbasierten Methode (M2) und der Label Propagation (M1) korrekt als warm erkannt. Das deutet darauf hin, dass eure Regeln hier echten Mehrwert gegenüber der reinen Rechen-Distanz liefern.
 
+Für einen schnellen Überblick habe ich zusätzlich eine Übersichtsgrafik beigelegt (`erdbeere_v3_strategy_comparison_overview.png`) mit vier Panels:
+
+- oben links: wie ähnlich sich die Strategien insgesamt sind,
+- oben rechts: wie ausgewogen jede Strategie die Cluster füllt,
+- unten links: wo eure Vorgabe-Rezepte unter jeder Strategie landen (✓ = trifft das von euch vorgesehene Cluster),
+- unten rechts: bei welchen Rezepten sich die Strategien einig bzw. uneinig sind.
+
+Besonders aussagekräftig ist das Panel unten links: Von euren 11 Vorgabe-Rezepten trifft die Label Propagation (M1) 11/11 und die regelbasierte Methode (M2) 10/11 das vorgesehene Cluster, während die reinen Centroid-Strategien nur 3–8/11 erreichen. (Hinweis: kein einziges Rezept wird von allen 9 Strategien identisch zugeordnet – die Spalten werden sich also nie komplett gleichen.)
+
 Was ich mir von euch wünsche:
 
 1. Welche Strategie-Spalte entspricht insgesamt am ehesten der Panelisten-Gruppierung?

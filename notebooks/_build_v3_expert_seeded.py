@@ -1,0 +1,982 @@
+"""Build the v3 expert-seeded clustering notebook.
+
+This is a notebook-generation script. It writes
+recipe_clustering_erdbeere_mds_all_algorithms_v3_expert_seeded.ipynb
+based on the v2 notebook structure but with:
+  - K fixed at 7 (from the expert Vorgabe.xlsx)
+  - 3 centroid-seeding strategies x all algorithms
+
+Run from project root:
+    python notebooks/_build_v3_expert_seeded.py
+"""
+import json
+from pathlib import Path
+
+NB_PATH = Path("notebooks/recipe_clustering_erdbeere_mds_all_algorithms_v3_expert_seeded.ipynb")
+
+
+def md(text: str) -> dict:
+    return {"cell_type": "markdown", "metadata": {}, "source": text.splitlines(keepends=True)}
+
+
+def code(text: str) -> dict:
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": text.splitlines(keepends=True),
+    }
+
+
+CELLS: list[dict] = []
+
+# ---------------------------------------------------------------------------
+# 0. Title / overview
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """# Erdbeere Recipe Clustering - Expert-Seeded Centroids (v3)
+
+This notebook mirrors the v2 *all algorithms / no threshold* notebook with one
+key change: the **number of clusters and their centroids are seeded from
+expert knowledge** in `data/gold/Erdbeer Clustering Sensorik Vorgabe.xlsx`.
+
+The aim is to evaluate three different ways of building seed centroids and to
+compare how each clustering algorithm responds to that seeding.
+
+## Five centroid strategies
+
+| Strategy | Seed source | Aggregation | Floral fallback |
+|---|---|---|---|
+| **S1 - Target Recipes (mean)** | OT1 vectors of `Target Recipes` per cluster | mean | top recipes where OT1=`floral` dominates |
+| **S2 - Ingredients (mean)** | OT1 vectors of recipes containing each cluster's characteristic CAS-Nr. | mean | same logic - recipes containing Jasmin-Absolue |
+| **S3 - Hybrid** | Target Recipes where available; ingredient-based for floral | mean | ingredient (Jasmin-Absolue) |
+| **S4 - Target Recipes (median)** | same source as S1 | element-wise median | OT1-dominant fallback, median |
+| **S5 - Ingredients (median)** | same source as S2 | element-wise median | ingredient (Jasmin-Absolue), median |
+
+S4 and S5 mirror S1 and S2 exactly except for the aggregation. The median is
+more robust to outlier recipes (e.g. recipes dominated by a single
+descriptor) and tends to produce sparser centroids on this 13-d OT1 space.
+
+## Expert clusters (k=7)
+`warm, floral, Walderdbeere, green, dairy, unpleasant, fruity`
+
+Black-List rows from the expert file are merged back into their parent
+clusters as extra characteristic ingredients. The `186.521` Target Recipe is
+**missing from the dataset** (likely typo) and is dropped.
+"""))
+
+# ---------------------------------------------------------------------------
+# 1. Setup
+# ---------------------------------------------------------------------------
+CELLS.append(md("## 1. Setup & Imports\n"))
+
+CELLS.append(code(
+    """import sys, os
+PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), '..'))
+sys.path.insert(0, PROJECT_ROOT)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import Ellipse
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+from scipy.optimize import linear_sum_assignment
+from sklearn.manifold import MDS
+from sklearn.preprocessing import normalize
+from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
+from sklearn.cluster import KMeans, DBSCAN, SpectralClustering
+from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    from sklearn.cluster import HDBSCAN as _HDBSCAN
+    _has_hdbscan = True
+except ImportError:
+    _has_hdbscan = False
+
+OUTPUT_DIR = '../outputs'
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+CSV_PATH    = Path('../data/gold/Third_Trial_Set_PDM Erdbeere Gesamt 8-5-2026.csv')
+IGNORE_PATH = Path('../data/gold/ignone_substances.csv')
+EXPERT_XLSX = Path('../data/gold/Erdbeer Clustering Sensorik Vorgabe.xlsx')
+
+OT1, OT2, OT3 = 'Odour-Type 1', 'Odour-Type 2', 'Odour-Type 3'
+THRESHOLD_COL = 'Threshold'
+REZ_COL, IDENT_COL, CAS_COL, NAME_COL, TOTAL_COL = 'Rez.-Nr.', 'Ident', 'CAS-Nr.', 'Name', 'Totalmenge'
+
+# Expert cluster names → stable color used across every plot in the notebook.
+EXPERT_CLUSTERS = ['warm', 'floral', 'Walderdbeere', 'green', 'dairy', 'unpleasant', 'fruity']
+EXPERT_COLORS = {
+    'warm':         '#E63946',
+    'floral':       '#F4A261',
+    'Walderdbeere': '#9B59B6',
+    'green':        '#2A9D8F',
+    'dairy':        '#E9C46A',
+    'unpleasant':   '#264653',
+    'fruity':       '#E76F51',
+}
+
+K_EXPERT = len(EXPERT_CLUSTERS)
+print(f'Libraries loaded. HDBSCAN available: {_has_hdbscan}')
+print(f'Expert clusters (k={K_EXPERT}): {EXPERT_CLUSTERS}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 2. Load data (same as v2)
+# ---------------------------------------------------------------------------
+CELLS.append(md("## 2. Load Erdbeere Recipe Data\n"))
+
+CELLS.append(code(
+    """def to_float(v, fallback=0.0):
+    if v is None: return fallback
+    if isinstance(v, (int, float)): return float(v)
+    try: return float(str(v).strip().replace(',', '.'))
+    except: return fallback
+
+df_raw = pd.read_csv(CSV_PATH, dtype=str)
+df_raw[TOTAL_COL]     = df_raw[TOTAL_COL].apply(to_float)
+df_raw[THRESHOLD_COL] = df_raw[THRESHOLD_COL].apply(to_float)
+df = df_raw[df_raw[REZ_COL].notna()].copy()
+
+if IGNORE_PATH.exists():
+    ign             = pd.read_csv(IGNORE_PATH)
+    ign_idents      = set(ign[IDENT_COL].dropna().astype(str).str.strip())
+    names_to_ignore = {str(n).lower().strip() for n in ign[NAME_COL]}
+    mask = (
+        df[IDENT_COL].astype(str).str.strip().isin(ign_idents) |
+        df[NAME_COL].str.lower().str.strip().isin(names_to_ignore)
+    )
+    cas_to_ignore = set(df.loc[mask, CAS_COL].dropna().astype(str).str.strip())
+    df.loc[df[CAS_COL].astype(str).str.strip().isin(cas_to_ignore), TOTAL_COL] = 0.0
+    print(f'Ignored idents: {len(ign_idents)} | Ignored CAS: {len(cas_to_ignore)}')
+
+per_recipe_total = df.groupby(REZ_COL)[TOTAL_COL].transform('sum')
+df[TOTAL_COL] = np.where(per_recipe_total > 0, df[TOTAL_COL] / per_recipe_total, df[TOTAL_COL])
+
+recipes = df[REZ_COL].unique().tolist()
+n = len(recipes)
+print(f'Recipes: {n}  |  Ingredient rows: {len(df)}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 3. Build OT1 vectors + MDS coords
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 3. Build OT1 Feature Vectors
+
+Same feature space as the v2 notebook: each recipe → normalized vector over
+the OT1 (Odour-Type 1) vocabulary, weighted by `Totalmenge`. All
+centroid construction below happens in **this** space.
+"""))
+
+CELLS.append(code(
+    """def norm_term(term):
+    if pd.isna(term) or not isinstance(term, str): return None
+    t = term.lower().strip().replace('"', '').replace("'", '').rstrip('.,;:')
+    return t if len(t) >= 2 else None
+
+def build_vocabulary(df, feature_cols):
+    vocab = set()
+    for col in feature_cols:
+        if col in df.columns:
+            for t in df[col].dropna().map(norm_term):
+                if t: vocab.add(t)
+    return sorted(vocab)
+
+def build_recipe_vectors(df, recipes, feature_cols_weighted):
+    feature_cols = [col for col, _ in feature_cols_weighted]
+    vocab        = build_vocabulary(df, feature_cols)
+    vocab_to_idx = {t: i for i, t in enumerate(vocab)}
+    vectors      = np.zeros((len(recipes), len(vocab)), dtype=np.float64)
+    for r_idx, recipe in enumerate(recipes):
+        for _, row in df[df[REZ_COL] == recipe].iterrows():
+            qty = float(row[TOTAL_COL])
+            if qty <= 0: continue
+            for col, col_weight in feature_cols_weighted:
+                term = norm_term(row.get(col))
+                if term and term in vocab_to_idx:
+                    vectors[r_idx, vocab_to_idx[term]] += col_weight * qty
+    return vocab, vocab_to_idx, normalize(vectors)
+
+vocab, vocab_to_idx, vecs = build_recipe_vectors(df, recipes, [(OT1, 1.0)])
+print(f'OT1 vocabulary ({len(vocab)} terms): {vocab}')
+print(f'Recipe vectors shape: {vecs.shape}')
+
+# Precompute cosine dissimilarity matrix (used by every algo + MDS)
+sim  = np.clip(vecs @ vecs.T, -1.0, 1.0)
+diss = 1.0 - sim
+np.fill_diagonal(diss, 0.0)
+
+# Run MDS once for visualization
+mds_coords = MDS(n_components=2, dissimilarity='precomputed', metric=True,
+                 n_init=10, max_iter=1000, random_state=42,
+                 normalized_stress='auto').fit_transform(diss)
+print(f'MDS coords shape: {mds_coords.shape}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 4. Parse expert Excel
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 4. Parse Expert Centroids from Vorgabe.xlsx
+
+The Excel uses a forward-fill convention: the `Cluster` column only carries
+the name on the first row of each cluster. The `Black List` section adds
+**extra characteristic ingredients** to existing clusters (unpleasant,
+fruity, warm). We merge those back.
+"""))
+
+CELLS.append(code(
+    """xlsx_raw = pd.read_excel(EXPERT_XLSX)
+
+# Forward-fill cluster name, BUT reset to None when we hit the 'Black List' separator
+# (Black List is a section marker, not a cluster — rows below it carry their own Cluster value)
+expert_df = xlsx_raw.copy()
+bl_idx = expert_df.index[expert_df['Cluster'] == 'Black List']
+if len(bl_idx) > 0:
+    bl_pos = bl_idx[0]
+    # Forward-fill only up to (and not including) the Black List row
+    expert_df.loc[:bl_pos - 1, 'Cluster'] = expert_df.loc[:bl_pos - 1, 'Cluster'].ffill()
+    # After Black List, forward-fill within each cluster the user named
+    expert_df.loc[bl_pos + 1:, 'Cluster'] = expert_df.loc[bl_pos + 1:, 'Cluster'].ffill()
+else:
+    expert_df['Cluster'] = expert_df['Cluster'].ffill()
+
+# Drop the Black List separator row and rows without ingredient info
+expert_df = expert_df[(expert_df['Cluster'] != 'Black List') & expert_df['Cluster'].notna()].copy()
+
+# Build the per-cluster spec
+expert_spec = {}
+for cluster_name, sub in expert_df.groupby('Cluster'):
+    cas_list = sub['CAS-Nr.'].dropna().astype(str).str.strip().tolist()
+    rohstoffe = sub['Rohstoff'].dropna().astype(str).str.strip().tolist()
+    target_recipes_raw = sub['Target Recipes'].dropna().tolist()
+    target_recipes = [f'{t:.3f}' for t in target_recipes_raw]
+    descriptors = sub['Deskriptoren allgemein'].dropna().astype(str).str.strip().tolist()
+    expert_spec[cluster_name] = {
+        'cas': cas_list,
+        'rohstoffe': rohstoffe,
+        'target_recipes': target_recipes,
+        'descriptors': descriptors,
+    }
+
+# Sanity print
+for name in EXPERT_CLUSTERS:
+    s = expert_spec.get(name, {})
+    print(f'{name:14s}  ingredients={len(s.get("cas", [])):2d}  targets={len(s.get("target_recipes", [])):2d}  '
+          f'descriptors={s.get("descriptors", [])}')
+"""))
+
+CELLS.append(code(
+    """# Map every Target Recipe ID (e.g. '185.237') to a dataset recipe (e.g. '185.237H')
+def match_recipe_prefix(target_id, recipes):
+    matches = [r for r in recipes if r.startswith(target_id)]
+    return matches[0] if matches else None
+
+print('Target Recipe → dataset match resolution:')
+unmatched = []
+for cname, s in expert_spec.items():
+    resolved = []
+    for t in s['target_recipes']:
+        m = match_recipe_prefix(t, recipes)
+        if m is None: unmatched.append((cname, t))
+        else: resolved.append(m)
+    s['target_recipes_resolved'] = resolved
+    print(f'  {cname:14s}  {len(resolved)}/{len(s["target_recipes"])} matched  →  {resolved}')
+
+if unmatched:
+    print(f'\\n⚠ Dropped unmatched targets: {unmatched}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 5. Three centroid strategies
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 5. Build Three Centroid Strategies
+
+Each strategy returns a dict `{cluster_name → centroid_vector}` in the same
+OT1 vocabulary space as the recipe vectors. Centroids are L2-normalized so
+cosine similarity (= dot product) is the natural distance.
+"""))
+
+CELLS.append(code(
+    """def _normalize_vec(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
+
+def _mean_of_indices(idxs, vectors):
+    if not idxs: return None
+    c = vectors[idxs].mean(axis=0)
+    return _normalize_vec(c)
+
+def _median_of_indices(idxs, vectors):
+    if not idxs: return None
+    c = np.median(vectors[idxs], axis=0)
+    # If element-wise median collapses to all-zero (can happen on sparse
+    # normalized vectors when fewer than half the recipes activate a dim),
+    # fall back to the mean so the centroid remains well-defined.
+    if np.linalg.norm(c) < 1e-12:
+        c = vectors[idxs].mean(axis=0)
+    return _normalize_vec(c)
+
+def _recipes_containing_cas(cas_list, df, recipes):
+    \"\"\"Return indices of recipes whose ingredient list contains any of the given CAS numbers.\"\"\"
+    if not cas_list: return []
+    cas_set = {str(c).strip() for c in cas_list}
+    rec_ids = df[df[CAS_COL].astype(str).str.strip().isin(cas_set)][REZ_COL].unique().tolist()
+    return [i for i, r in enumerate(recipes) if r in rec_ids]
+
+def _ot1_dominant_recipes(ot1_term, vectors, vocab_to_idx, top_n=5):
+    \"\"\"Return indices of the top_n recipes with the highest weight on ``ot1_term``.\"\"\"
+    if ot1_term not in vocab_to_idx: return []
+    col = vocab_to_idx[ot1_term]
+    return list(np.argsort(vectors[:, col])[::-1][:top_n])
+
+# ── Strategy 1: Target Recipes (with OT1-dominant fallback) ──────────────────
+def build_strategy_target_recipes(expert_spec, vectors, recipes, vocab_to_idx):
+    centroids = {}
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        resolved = s.get('target_recipes_resolved', [])
+        idxs = [recipes.index(r) for r in resolved if r in recipes]
+        if idxs:
+            centroids[cname] = _mean_of_indices(idxs, vectors)
+        else:
+            # OT1-only fallback: if the cluster name itself is an OT1 term, use it
+            fallback_term = cname.lower()
+            idxs = _ot1_dominant_recipes(fallback_term, vectors, vocab_to_idx, top_n=5)
+            centroids[cname] = _mean_of_indices(idxs, vectors)
+            print(f'  [S1] {cname}: no targets, OT1-dominant fallback on "{fallback_term}" → {len(idxs)} recipes')
+    return centroids
+
+# ── Strategy 2: Characteristic Ingredients ───────────────────────────────────
+def build_strategy_ingredients(expert_spec, vectors, recipes, df):
+    centroids = {}
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        idxs = _recipes_containing_cas(s.get('cas', []), df, recipes)
+        if not idxs:
+            print(f'  [S2] {cname}: no recipes contain any expert CAS — leaving as None')
+            centroids[cname] = None
+            continue
+        centroids[cname] = _mean_of_indices(idxs, vectors)
+    return centroids
+
+# ── Strategy 3: Hybrid (target recipes + ingredient fallback) ────────────────
+def build_strategy_hybrid(expert_spec, vectors, recipes, df):
+    centroids = {}
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        resolved = s.get('target_recipes_resolved', [])
+        idxs = [recipes.index(r) for r in resolved if r in recipes]
+        if not idxs:
+            idxs = _recipes_containing_cas(s.get('cas', []), df, recipes)
+            print(f'  [S3] {cname}: no targets, ingredient fallback → {len(idxs)} recipes')
+        centroids[cname] = _mean_of_indices(idxs, vectors)
+    return centroids
+
+# ── Strategy 4: Target Recipes (median aggregation) ──────────────────────────
+def build_strategy_target_recipes_median(expert_spec, vectors, recipes, vocab_to_idx):
+    centroids = {}
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        resolved = s.get('target_recipes_resolved', [])
+        idxs = [recipes.index(r) for r in resolved if r in recipes]
+        if idxs:
+            centroids[cname] = _median_of_indices(idxs, vectors)
+        else:
+            fallback_term = cname.lower()
+            idxs = _ot1_dominant_recipes(fallback_term, vectors, vocab_to_idx, top_n=5)
+            centroids[cname] = _median_of_indices(idxs, vectors)
+            print(f'  [S4] {cname}: no targets, OT1-dominant fallback on "{fallback_term}" → {len(idxs)} recipes (median)')
+    return centroids
+
+# ── Strategy 5: Characteristic Ingredients (median aggregation) ──────────────
+def build_strategy_ingredients_median(expert_spec, vectors, recipes, df):
+    centroids = {}
+    for cname in EXPERT_CLUSTERS:
+        s = expert_spec.get(cname, {})
+        idxs = _recipes_containing_cas(s.get('cas', []), df, recipes)
+        if not idxs:
+            print(f'  [S5] {cname}: no recipes contain any expert CAS — leaving as None')
+            centroids[cname] = None
+            continue
+        centroids[cname] = _median_of_indices(idxs, vectors)
+    return centroids
+
+STRATEGIES = {
+    'S1_target_recipes':        build_strategy_target_recipes(expert_spec, vecs, recipes, vocab_to_idx),
+    'S2_ingredients':           build_strategy_ingredients(expert_spec, vecs, recipes, df),
+    'S3_hybrid':                build_strategy_hybrid(expert_spec, vecs, recipes, df),
+    'S4_target_recipes_median': build_strategy_target_recipes_median(expert_spec, vecs, recipes, vocab_to_idx),
+    'S5_ingredients_median':    build_strategy_ingredients_median(expert_spec, vecs, recipes, df),
+}
+
+# Validate: every strategy must have all 7 centroids
+for s_name, c_dict in STRATEGIES.items():
+    missing = [c for c, v in c_dict.items() if v is None]
+    if missing:
+        print(f'⚠ {s_name} missing centroids for: {missing}')
+    else:
+        print(f'✅ {s_name}: 7 centroids built')
+"""))
+
+CELLS.append(code(
+    """# Quick look at the centroids — which OT1 terms dominate each cluster, per strategy
+for s_name, c_dict in STRATEGIES.items():
+    print(f'\\n=== {s_name} ===')
+    for cname in EXPERT_CLUSTERS:
+        v = c_dict.get(cname)
+        if v is None:
+            print(f'  {cname:14s}  (missing)')
+            continue
+        top3 = sorted(enumerate(v), key=lambda kv: kv[1], reverse=True)[:3]
+        top3_named = [(vocab[i], round(w, 3)) for i, w in top3]
+        print(f'  {cname:14s}  top OT1: {top3_named}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 6. Algorithm implementations + Hungarian alignment
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 6. Clustering Algorithms (seeded + Hungarian-aligned variants)
+
+Algorithms that natively accept seed centroids (K-Means, GMM, K-Medoids,
+Fuzzy c-Means, DEC, NearestCentroid) consume the seeds directly. The rest
+(Ward, DBSCAN, HDBSCAN, Spectral, SOM) run unseeded at k=7 and have their
+cluster IDs **re-labeled to expert cluster names** via Hungarian assignment
+on cluster-centroid cosine distance.
+
+All algorithms return labels as **expert cluster name strings**, so plots and
+exports stay on the same color and naming scheme.
+"""))
+
+CELLS.append(code(
+    """def centroids_to_matrix(centroids_dict, cluster_order=None):
+    \"\"\"Stack a {name: vec} dict into (matrix, name_list) in a stable order.\"\"\"
+    names = cluster_order or list(centroids_dict.keys())
+    mat = np.array([centroids_dict[n] for n in names])
+    return mat, names
+
+def nearest_centroid_labels(vectors, centroid_mat, name_list):
+    \"\"\"Argmin cosine distance to each centroid; returns array of expert-cluster name strings.\"\"\"
+    # vectors and centroid_mat are L2-normalized → cosine sim = dot product
+    sims = vectors @ centroid_mat.T
+    idx  = np.argmax(sims, axis=1)
+    return np.array([name_list[i] for i in idx])
+
+def hungarian_align(algo_labels_int, vectors, centroid_mat, name_list):
+    \"\"\"Map integer algorithm labels to expert cluster name strings via Hungarian assignment.
+
+    Extra algorithm clusters (when an algo finds >7 clusters) get the
+    'extra_<id>' label and are kept visible but uncolored.
+    \"\"\"
+    uniq = sorted(set(algo_labels_int))
+    n_e  = len(name_list)
+    # cluster centers in OT1 space (normalized so cosine = dot)
+    centers = np.array([vectors[algo_labels_int == c].mean(axis=0) for c in uniq])
+    norms   = np.linalg.norm(centers, axis=1, keepdims=True)
+    centers = centers / np.maximum(norms, 1e-12)
+
+    cost = 1.0 - centers @ centroid_mat.T        # (n_uniq, n_e)
+    n_u  = cost.shape[0]
+    K    = max(n_u, n_e)
+    padded = np.full((K, K), 10.0)
+    padded[:n_u, :n_e] = cost
+    row_ind, col_ind = linear_sum_assignment(padded)
+    mapping = {}
+    for r, c in zip(row_ind, col_ind):
+        if r < n_u and c < n_e:
+            mapping[uniq[r]] = name_list[c]
+    return np.array([mapping.get(l, f'extra_{l}') for l in algo_labels_int])
+
+print('Alignment helpers defined.')
+"""))
+
+CELLS.append(code(
+    """# ── K-Medoids with seeded medoids ────────────────────────────────────────────
+def kmedoids_seeded(dist_matrix, centroid_mat, name_list, vectors, max_iter=500):
+    # Initial medoids = the recipe nearest to each seed centroid
+    sims = vectors @ centroid_mat.T
+    medoids = [int(np.argmax(sims[:, j])) for j in range(centroid_mat.shape[0])]
+    seen = set(); medoids_uniq = []
+    for m in medoids:
+        if m not in seen: medoids_uniq.append(m); seen.add(m)
+    # If duplicates collapsed, fill with random unused
+    while len(medoids_uniq) < centroid_mat.shape[0]:
+        for i in range(dist_matrix.shape[0]):
+            if i not in seen: medoids_uniq.append(i); seen.add(i); break
+    medoids = medoids_uniq
+
+    for _ in range(max_iter):
+        labels = np.argmin(dist_matrix[:, medoids], axis=1)
+        new_medoids = []
+        for c in range(len(medoids)):
+            pts = np.where(labels == c)[0]
+            if len(pts) == 0:
+                new_medoids.append(medoids[c]); continue
+            sub = dist_matrix[np.ix_(pts, pts)]
+            new_medoids.append(int(pts[np.argmin(sub.sum(axis=1))]))
+        if new_medoids == medoids: break
+        medoids = new_medoids
+    labels = np.argmin(dist_matrix[:, medoids], axis=1)
+    return np.array([name_list[i] for i in labels])
+
+# ── Fuzzy c-Means with seeded centroids ──────────────────────────────────────
+def fuzzy_cmeans_seeded(X, centroid_mat, name_list, m=2.0, max_iter=500, tol=1e-7):
+    n  = X.shape[0]
+    centroids = centroid_mat.copy()
+    c = centroids.shape[0]
+    # Init U from distances
+    dist = np.array([[np.linalg.norm(X[j] - centroids[i]) for j in range(n)] for i in range(c)])
+    dist = np.maximum(dist, 1e-12)
+    ratio = dist[None, :, :] / dist[:, None, :]
+    U = 1.0 / (ratio ** (2.0 / (m - 1))).sum(axis=1)
+    U /= U.sum(axis=0, keepdims=True)
+    for _ in range(max_iter):
+        Um = U ** m
+        centroids = (Um @ X) / Um.sum(axis=1, keepdims=True)
+        dist = np.array([[np.linalg.norm(X[j] - centroids[i]) for j in range(n)] for i in range(c)])
+        dist = np.maximum(dist, 1e-12)
+        ratio = dist[None, :, :] / dist[:, None, :]
+        U_new = 1.0 / (ratio ** (2.0 / (m - 1))).sum(axis=1)
+        U_new /= U_new.sum(axis=0, keepdims=True)
+        if np.max(np.abs(U_new - U)) < tol: break
+        U = U_new
+    labels = np.argmax(U, axis=0)
+    return np.array([name_list[i] for i in labels])
+
+# ── DEC simplified with seeded initial PCA-kmeans centers ────────────────────
+def dec_simplified_seeded(X, centroid_mat, name_list, enc_dim=8, n_iter=300):
+    d = min(enc_dim, X.shape[1], X.shape[0] - 1)
+    pca = PCA(n_components=d, random_state=42).fit(X)
+    Z   = pca.transform(X)
+    Z_seeds = pca.transform(centroid_mat)  # project seeds to PCA space
+    centers = Z_seeds.copy()
+    for _ in range(n_iter):
+        dist2 = np.sum((Z[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        q     = 1.0 / (1.0 + dist2)
+        q    /= q.sum(axis=1, keepdims=True)
+        f     = q.sum(axis=0)
+        p     = (q ** 2) / np.maximum(f, 1e-12)
+        p    /= p.sum(axis=1, keepdims=True)
+        for j in range(centers.shape[0]):
+            centers[j] = (p[:, j:j+1] * Z).sum(axis=0) / max(p[:, j].sum(), 1e-12)
+    labels = np.argmax(q, axis=1)
+    return np.array([name_list[i] for i in labels])
+
+# ── SOM with k-Means on nodes seeded by centroids ────────────────────────────
+def som_cluster_seeded(X, centroid_mat, name_list,
+                       lr=0.5, sigma=1.5, n_iter=8000, random_state=42):
+    rng     = np.random.RandomState(random_state)
+    k       = centroid_mat.shape[0]
+    g       = int(np.ceil(np.sqrt(k)))
+    n_nodes = g * g
+    weights = normalize(rng.randn(n_nodes, X.shape[1]))
+    node_pos = np.array([(r, c) for r in range(g) for c in range(g)], dtype=float)
+    for t in range(n_iter):
+        frac  = 1.0 - t / n_iter
+        lr_t  = lr * frac
+        sig_t = max(sigma * frac, 0.01)
+        xi    = X[rng.randint(0, X.shape[0])]
+        bmu   = np.argmin(np.linalg.norm(weights - xi, axis=1))
+        d2    = ((node_pos - node_pos[bmu]) ** 2).sum(axis=1)
+        h     = np.exp(-d2 / (2 * sig_t ** 2))
+        weights += lr_t * h[:, None] * (xi - weights)
+    # Cluster node weights with k-Means *seeded by expert centroids*
+    node_labels = KMeans(n_clusters=k, init=centroid_mat, n_init=1,
+                         random_state=random_state).fit_predict(weights)
+    recipe_labels = np.array([node_labels[np.argmin(np.linalg.norm(weights - xi, axis=1))] for xi in X])
+    return np.array([name_list[i] for i in recipe_labels])
+
+# ── DBSCAN / HDBSCAN: scan params for k≈7, then Hungarian align ──────────────
+def dbscan_target_k(diss_m, K, eps_grid=np.arange(0.01, 1.00, 0.01)):
+    best_eps, best_raw = None, None
+    best_diff = float('inf')
+    for eps in eps_grid:
+        raw = DBSCAN(eps=eps, min_samples=2, metric='precomputed').fit_predict(diss_m)
+        n_clust = len(set(raw) - {-1})
+        diff = abs(n_clust - K)
+        if diff < best_diff:
+            best_diff, best_eps, best_raw = diff, eps, raw
+        if n_clust == K and (raw == -1).sum() == 0: break
+    # Resolve noise to nearest non-noise
+    labels = best_raw.copy()
+    noise  = np.where(labels == -1)[0]
+    non_n  = np.where(labels != -1)[0]
+    if len(non_n) == 0:
+        return np.zeros(len(labels), dtype=int)
+    for i in noise:
+        labels[i] = labels[non_n[np.argmin(diss_m[i, non_n])]]
+    return labels
+
+def hdbscan_target_k(diss_m, K, n_recipes):
+    if not _has_hdbscan: return None
+    best_mcs, best_raw = None, None
+    best_diff = float('inf')
+    for mcs in range(2, min(n_recipes, 20)):
+        raw = _HDBSCAN(min_cluster_size=mcs, metric='precomputed').fit_predict(diss_m)
+        n_clust = len(set(raw) - {-1})
+        diff = abs(n_clust - K)
+        if diff < best_diff:
+            best_diff, best_mcs, best_raw = diff, mcs, raw
+    if best_raw is None: return None
+    labels = best_raw.copy()
+    noise  = np.where(labels == -1)[0]
+    non_n  = np.where(labels != -1)[0]
+    if len(non_n) == 0:
+        return np.zeros(len(labels), dtype=int)
+    for i in noise:
+        labels[i] = labels[non_n[np.argmin(diss_m[i, non_n])]]
+    return labels
+
+print('Algorithm implementations ready.')
+"""))
+
+# ---------------------------------------------------------------------------
+# 7. Run all combinations
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 7. Run All Strategies × All Algorithms
+
+10 algorithms × 3 strategies = 30 partitions. Stored in
+`results[strategy][algo] = labels` where labels are expert cluster name
+strings.
+"""))
+
+CELLS.append(code(
+    """def run_all_algos(centroids_dict, vectors, diss_m):
+    centroid_mat, name_list = centroids_to_matrix(centroids_dict, cluster_order=EXPERT_CLUSTERS)
+    K = len(name_list)
+    out = {}
+
+    # ── Seeded algorithms (return expert names directly) ─────────────────────
+    out['NearestCentroid'] = nearest_centroid_labels(vectors, centroid_mat, name_list)
+
+    km_int = KMeans(n_clusters=K, init=centroid_mat, n_init=1,
+                    random_state=42).fit_predict(vectors)
+    out['k-Means'] = np.array([name_list[i] for i in km_int])
+
+    out['k-Medoids'] = kmedoids_seeded(diss_m, centroid_mat, name_list, vectors)
+
+    enc_dim_gmm = min(K, vectors.shape[0] - 1, vectors.shape[1])
+    Z_gmm = PCA(n_components=enc_dim_gmm, random_state=42).fit_transform(vectors)
+    means_init_gmm = PCA(n_components=enc_dim_gmm, random_state=42).fit(vectors).transform(centroid_mat)
+    gmm_int = GaussianMixture(n_components=K, n_init=1, means_init=means_init_gmm,
+                              covariance_type='full', random_state=42).fit_predict(Z_gmm)
+    out['GMM'] = np.array([name_list[i] for i in gmm_int])
+
+    enc_dim_fcm = min(max(K, 4), vectors.shape[0] - 1, vectors.shape[1])
+    pca_fcm = PCA(n_components=enc_dim_fcm, random_state=42).fit(vectors)
+    Z_fcm = pca_fcm.transform(vectors)
+    seeds_fcm = pca_fcm.transform(centroid_mat)
+    out['Fuzzy c-Means'] = fuzzy_cmeans_seeded(Z_fcm, seeds_fcm, name_list)
+
+    out['SOM'] = som_cluster_seeded(vectors, centroid_mat, name_list)
+
+    out['DEC (simpl.)'] = dec_simplified_seeded(vectors, centroid_mat, name_list)
+
+    # ── Unseedable algorithms — Hungarian align after the fact ───────────────
+    Z_ward = linkage(squareform(diss_m, checks=False), method='ward')
+    ward_int = fcluster(Z_ward, t=K, criterion='maxclust')
+    out['Ward'] = hungarian_align(ward_int, vectors, centroid_mat, name_list)
+
+    db_int = dbscan_target_k(diss_m, K)
+    out['DBSCAN'] = hungarian_align(db_int, vectors, centroid_mat, name_list)
+
+    if _has_hdbscan:
+        hdb_int = hdbscan_target_k(diss_m, K, len(vectors))
+        out['HDBSCAN'] = hungarian_align(hdb_int, vectors, centroid_mat, name_list)
+    else:
+        out['HDBSCAN'] = None
+
+    affinity = np.clip(1.0 - diss_m, 0.0, 1.0); np.fill_diagonal(affinity, 1.0)
+    spec_int = SpectralClustering(n_clusters=K, affinity='precomputed',
+                                  n_init=30, random_state=42).fit_predict(affinity)
+    out['Spectral'] = hungarian_align(spec_int, vectors, centroid_mat, name_list)
+    return out
+
+results = {}
+for s_name, c_dict in STRATEGIES.items():
+    if any(v is None for v in c_dict.values()):
+        print(f'⚠ Skipping {s_name} (missing centroids)')
+        continue
+    print(f'\\nRunning {s_name}...')
+    results[s_name] = run_all_algos(c_dict, vecs, diss)
+    # Brief per-algo summary
+    for algo, lbl in results[s_name].items():
+        if lbl is None: continue
+        uniq, counts = np.unique(lbl, return_counts=True)
+        print(f'  {algo:18s}  {dict(zip(uniq, counts))}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 8-10. Plot each strategy
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 8. MDS Visualization Helper
+"""))
+
+CELLS.append(code(
+    """def confidence_ellipse(x, y, ax, n_std=1.5, **kwargs):
+    if len(x) < 2:
+        ax.scatter(x, y, s=80, color=kwargs.get('facecolor', 'gray'), zorder=4)
+        return
+    cov = np.cov(x, y)
+    ev, evec = np.linalg.eigh(cov)
+    order = ev.argsort()[::-1]
+    ev, evec = ev[order], evec[:, order]
+    angle  = np.degrees(np.arctan2(*evec[:, 0][::-1]))
+    width  = max(2 * n_std * np.sqrt(abs(ev[0])), 0.001)
+    height = max(2 * n_std * np.sqrt(abs(ev[1])), 0.001)
+    ax.add_patch(Ellipse(xy=(np.mean(x), np.mean(y)),
+                         width=width, height=height, angle=angle, **kwargs))
+
+def mds_plot_named(ax, coords, names, str_labels, title, show_legend=False):
+    \"\"\"Plot MDS coords colored by expert cluster name (string label).\"\"\"
+    unique = sorted(set(str_labels))
+    ax.set_facecolor('#FAFAFA')
+    ax.axhline(0, color='#CCCCCC', lw=0.7, zorder=1)
+    ax.axvline(0, color='#CCCCCC', lw=0.7, zorder=1)
+    for lbl in unique:
+        mask = np.array(str_labels) == lbl
+        cx, cy = coords[mask, 0], coords[mask, 1]
+        col = EXPERT_COLORS.get(lbl, '#888888')  # extra_* → gray
+        confidence_ellipse(cx, cy, ax, n_std=1.5,
+                           facecolor=col, alpha=0.15, edgecolor=col,
+                           linewidth=1.2, linestyle='--', zorder=2)
+        ax.scatter(cx, cy, color=col, s=55, zorder=4, edgecolors='white', lw=0.7)
+        for i, name in enumerate(np.array(names)[mask]):
+            ax.annotate(name, (cx[i], cy[i]), fontsize=6, ha='center', va='bottom',
+                        xytext=(0, 4), textcoords='offset points', color=col)
+    ax.set_title(title, fontsize=9, fontweight='bold')
+    ax.set_xlabel('MDS Dim 1', fontsize=8)
+    ax.set_ylabel('MDS Dim 2', fontsize=8)
+    ax.grid(True, alpha=0.2, lw=0.4)
+    ax.tick_params(labelsize=7)
+    if show_legend:
+        present = [c for c in EXPERT_CLUSTERS if c in unique]
+        patches = [mpatches.Patch(color=EXPERT_COLORS[c], label=c) for c in present]
+        extras = [c for c in unique if c.startswith('extra_')]
+        for e in extras:
+            patches.append(mpatches.Patch(color='#888888', label=e))
+        ax.legend(handles=patches, fontsize=7, loc='best', framealpha=0.85)
+
+def plot_strategy_grid(strategy_name, results_for_strategy, save_path):
+    algos = list(results_for_strategy.keys())
+    n     = len(algos)
+    cols  = 4
+    rows  = -(-n // cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 5.5 * rows))
+    axes = axes.flatten()
+    for i, algo in enumerate(algos):
+        lbl = results_for_strategy[algo]
+        ax = axes[i]
+        if lbl is None:
+            ax.text(0.5, 0.5, f'{algo}\\n(not available)', ha='center', va='center',
+                    transform=ax.transAxes, fontsize=10, color='gray')
+            ax.set_title(algo, fontsize=9, fontweight='bold')
+            continue
+        title = f'{algo}  ({len(set(lbl))} clusters)'
+        mds_plot_named(ax, mds_coords, recipes, lbl, title, show_legend=True)
+    for j in range(i + 1, len(axes)):
+        axes[j].set_visible(False)
+    fig.suptitle(f'{strategy_name} - All Algorithms (Erdbeere, n={len(recipes)}, k={K_EXPERT}, expert-seeded)',
+                 fontsize=13, fontweight='bold', y=1.005)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f'Saved: {save_path}')
+
+print('Plotting helpers defined.')
+"""))
+
+CELLS.append(md("## 9. Strategy 1 - Target Recipes as Centroids\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S1: Target Recipes as Centroids',
+    results['S1_target_recipes'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S1_target_recipes_mds.png',
+)
+"""))
+
+CELLS.append(md("## 10. Strategy 2 - Characteristic Ingredients as Centroids\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S2: Characteristic Ingredients as Centroids',
+    results['S2_ingredients'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S2_ingredients_mds.png',
+)
+"""))
+
+CELLS.append(md("## 11. Strategy 3 - Hybrid (Target Recipes + Ingredient Fallback)\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S3: Hybrid (Target Recipes + Ingredient Fallback)',
+    results['S3_hybrid'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S3_hybrid_mds.png',
+)
+"""))
+
+CELLS.append(md("## 11b. Strategy 4 - Target Recipes (median aggregation)\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S4: Target Recipes (median)',
+    results['S4_target_recipes_median'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S4_target_recipes_median_mds.png',
+)
+"""))
+
+CELLS.append(md("## 11c. Strategy 5 - Characteristic Ingredients (median aggregation)\n"))
+CELLS.append(code(
+    """plot_strategy_grid(
+    'S5: Characteristic Ingredients (median)',
+    results['S5_ingredients_median'],
+    f'{OUTPUT_DIR}/erdbeere_v3_S5_ingredients_median_mds.png',
+)
+"""))
+
+# ---------------------------------------------------------------------------
+# 11. Cross-strategy agreement
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 12. Cross-Strategy Cluster Agreement
+
+For each algorithm, how stable is the partition across the five strategies?
+Higher ARI / NMI means the choice of seeding strategy matters less for that
+algorithm. Lower values mean the algorithm is sensitive to seed centroids.
+
+The pairs of greatest interest are:
+
+- **S1 vs S4**: mean vs median on the same Target-Recipe source — pure
+  aggregation-function effect.
+- **S2 vs S5**: mean vs median on the same ingredient-recipe source — same
+  question, larger sample per cluster.
+"""))
+
+CELLS.append(code(
+    """from itertools import combinations
+
+algos = list(next(iter(results.values())).keys())
+strategy_names = list(results.keys())
+
+rows = []
+for algo in algos:
+    row = {'Algorithm': algo}
+    for s_a, s_b in combinations(strategy_names, 2):
+        lbl_a = results[s_a][algo]
+        lbl_b = results[s_b][algo]
+        if lbl_a is None or lbl_b is None:
+            row[f'ARI {s_a} vs {s_b}'] = None
+            row[f'NMI {s_a} vs {s_b}'] = None
+            continue
+        row[f'ARI {s_a} vs {s_b}'] = round(adjusted_rand_score(lbl_a, lbl_b), 3)
+        row[f'NMI {s_a} vs {s_b}'] = round(normalized_mutual_info_score(lbl_a, lbl_b), 3)
+    rows.append(row)
+
+agreement_df = pd.DataFrame(rows)
+print('Cross-strategy agreement per algorithm:')
+print(agreement_df.to_string(index=False))
+"""))
+
+# ---------------------------------------------------------------------------
+# 12. Export Excel
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 13. Export Cluster Assignments to Excel
+
+One sheet per strategy. Each row is an algorithm; each column is an expert
+cluster (`Cluster_warm`, `Cluster_floral`, ...) listing the recipes assigned
+to it, newline-separated. An `Agreement` sheet holds the ARI / NMI table.
+"""))
+
+CELLS.append(code(
+    """out_xlsx = f'{OUTPUT_DIR}/cluster_assignments_expert_seeded_all_strategies.xlsx'
+
+with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
+    for s_name, algo_dict in results.items():
+        rows = []
+        for algo, lbl in algo_dict.items():
+            if lbl is None:
+                rows.append({'Algorithm': algo})
+                continue
+            row = {'Algorithm': algo}
+            uniq = sorted(set(lbl))
+            for cname in uniq:
+                mask = lbl == cname
+                rec_list = sorted(np.array(recipes)[mask].tolist())
+                row[f'Cluster_{cname}'] = '\\n'.join(rec_list)
+            rows.append(row)
+        sheet_df = pd.DataFrame(rows).fillna('')
+        sheet_df.to_excel(writer, sheet_name=s_name[:31], index=False)
+    agreement_df.to_excel(writer, sheet_name='Agreement', index=False)
+
+print(f'Exported: {out_xlsx}')
+
+# Print a per-cluster count summary across strategies
+print('\\nCluster sizes per algorithm × strategy:')
+for s_name, algo_dict in results.items():
+    print(f'\\n── {s_name} ──')
+    for algo, lbl in algo_dict.items():
+        if lbl is None:
+            print(f'  {algo:18s}  N/A'); continue
+        sizes = {c: int((lbl == c).sum()) for c in sorted(set(lbl))}
+        print(f'  {algo:18s}  {sizes}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 13. Quick takeaways
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 14. Quick Takeaways
+
+- All 10 algorithms can be made to honour the expert-supplied k=7 partition,
+  either by direct centroid seeding (K-Means, GMM, K-Medoids, Fuzzy c-Means,
+  SOM, DEC, NearestCentroid) or by Hungarian re-labeling (Ward, DBSCAN,
+  HDBSCAN, Spectral).
+- The cross-strategy ARI/NMI table in section 12 ranks algorithms by how
+  much they care about the choice of seed centroid - higher = less sensitive.
+- For interpretation, inspect the Excel export side-by-side with the
+  expert's `Target Recipes` column - any cluster where the Target Recipes
+  end up in different algorithm clusters is a candidate for closer review.
+
+Outputs written:
+
+- `outputs/erdbeere_v3_S1_target_recipes_mds.png`
+- `outputs/erdbeere_v3_S2_ingredients_mds.png`
+- `outputs/erdbeere_v3_S3_hybrid_mds.png`
+- `outputs/erdbeere_v3_S4_target_recipes_median_mds.png`
+- `outputs/erdbeere_v3_S5_ingredients_median_mds.png`
+- `outputs/cluster_assignments_expert_seeded_all_strategies.xlsx` (5 strategy sheets + Agreement)
+"""))
+
+
+# ---------------------------------------------------------------------------
+# Assemble JSON
+# ---------------------------------------------------------------------------
+notebook = {
+    "cells": CELLS,
+    "metadata": {
+        "kernelspec": {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3",
+        },
+        "language_info": {
+            "name": "python",
+            "version": "3.11",
+        },
+    },
+    "nbformat": 4,
+    "nbformat_minor": 5,
+}
+
+NB_PATH.write_text(json.dumps(notebook, indent=1))
+print(f'Wrote {NB_PATH}  ({len(CELLS)} cells)')

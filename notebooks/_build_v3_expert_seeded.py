@@ -79,7 +79,8 @@ clusters as extra characteristic ingredients. The `186.521` Target Recipe is
 CELLS.append(md("## 1. Setup & Imports\n"))
 
 CELLS.append(code(
-    """import sys, os
+    """%matplotlib inline
+import sys, os
 PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), '..'))
 sys.path.insert(0, PROJECT_ROOT)
 
@@ -1067,6 +1068,25 @@ CELLS.append(code(
 )
 """))
 
+CELLS.append(md("## 11e. Direct Methods - MDS comparison (M1 / M2 / M3)\n"))
+CELLS.append(code(
+    """_methods = [('M1_label_prop', 'M1: Label Propagation'),
+            ('M2_rule_based', 'M2: Rule-based'),
+            ('M3_consensus',  'M3: Consensus')]
+
+fig, axes = plt.subplots(1, 3, figsize=(6.5 * 3, 5.5))
+for ax, (key, title) in zip(axes, _methods):
+    lbl = direct_results[key]
+    mds_plot_named(ax, mds_coords, recipes, lbl,
+                   f'{title}  ({len(set(lbl))} clusters)', show_legend=True)
+fig.suptitle(f'Direct Methods (Erdbeere, n={len(recipes)}, k={K_EXPERT}, expert-seeded)',
+             fontsize=13, fontweight='bold', y=1.02)
+plt.tight_layout()
+plt.savefig(f'{OUTPUT_DIR}/erdbeere_v3_direct_methods_mds.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f'Saved: {OUTPUT_DIR}/erdbeere_v3_direct_methods_mds.png')
+"""))
+
 # ---------------------------------------------------------------------------
 # 11. Cross-strategy agreement
 # ---------------------------------------------------------------------------
@@ -1235,6 +1255,7 @@ Outputs written:
 - `outputs/erdbeere_v3_S4_target_recipes_median_mds.png`
 - `outputs/erdbeere_v3_S5_ingredients_median_mds.png`
 - `outputs/erdbeere_v3_S6_contrast_mds.png`
+- `outputs/erdbeere_v3_direct_methods_mds.png`
 - `outputs/cluster_assignments_expert_seeded_all_strategies.xlsx`
   (Strategy_Comparison + 6 strategy + 3 direct-method + 2 agreement sheets)
 """))

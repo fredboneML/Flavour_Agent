@@ -74,6 +74,41 @@ clusters as extra characteristic ingredients. The `186.521` Target Recipe is
 """))
 
 # ---------------------------------------------------------------------------
+# 0b. Strategy overview table (all strategies in the Excel)
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## Strategies in the Excel file - overview
+
+The companion file `cluster_assignments_expert_seeded_all_strategies.xlsx`
+contains **9 strategies** for turning the expert centroids into recipe clusters.
+Six are *centroid* strategies (S1-S6, each run through all 10 algorithms), three
+are *direct* methods (M1-M3, one labeling each). In the `Strategy_Comparison`
+master sheet the centroid strategies are represented by their **NearestCentroid**
+assignment.
+
+| Strategy | Type | Short description |
+|---|---|---|
+| **S1 - Target Recipes (mean)** | centroid | Mean OT1 vector of the expert's Target Recipes per cluster. |
+| **S2 - Ingredients (mean)** | centroid | Mean OT1 vector of all recipes that contain the cluster's characteristic ingredient (CAS-Nr.). |
+| **S3 - Hybrid** | centroid | Target Recipes where available, otherwise ingredient-based. |
+| **S4 - Target Recipes (median)** | centroid | Like S1 but element-wise **median** (more robust to outlier recipes). |
+| **S5 - Ingredients (median)** | centroid | Like S2 but element-wise **median**. |
+| **S6 - Contrast (Rocchio)** | centroid | Like S1 but subtracts the global background (β=0.5·mean of all other recipes) to emphasise what **distinguishes** each cluster from the shared fruity/sweet base. |
+| **M1 - Label Propagation** | direct | Expert target recipes are pinned to their cluster; labels diffuse to the rest through a **cosine k-NN graph** (k=10) over all recipes. No round-cluster assumption. |
+| **M2 - Rule-based** | direct | The expert `Regeln/Notizen` rules (e.g. `> 0,004 eindeutig`, `alle drei Rohstoffe müssen vorhanden sein`) applied on per-recipe normalized ingredient concentrations; recipes that fire no rule fall back to the nearest S1 centroid. |
+| **M3 - Consensus** | direct | Co-association across all non-degenerate algorithm runs + M1, re-clustered at k=7 — the most stable "majority" partition. |
+
+**Similarity / distance throughout:** recipes are vectors over the OT1
+descriptor vocabulary, **L2-normalized**, so cosine similarity = dot product.
+M1's k-NN graph and the S1-centroid assignments all use this cosine measure;
+M2's rules instead operate directly on ingredient (CAS) concentrations.
+
+Excel sheets: `Strategy_Comparison` (master, one row per recipe), one detail
+sheet per strategy (`S1_target_recipes` ... `M3_consensus`), and two agreement
+sheets (`Agreement_Strategies`, `Agreement_byAlgo`).
+"""))
+
+# ---------------------------------------------------------------------------
 # 1. Setup
 # ---------------------------------------------------------------------------
 CELLS.append(md("## 1. Setup & Imports\n"))

@@ -850,28 +850,75 @@ print('  sizes:', {c: int((direct_results['M1_label_prop'] == c).sum()) for c in
 
 # ── M2: Rule-based pre-assignment (full interpretation) ──────────────────────
 CELLS.append(code(
-    """# Expert rules transcribed in full from the 'Regeln/ Notizen' column of
-# Erdbeer Clustering Sensorik Vorgabe.xlsx. conc = per-recipe Totalmenge-
-# normalized amount of the marker CAS in that recipe.
+    """# Expert rules are PARSED from the 'Regeln/ Notizen' column of
+# Erdbeer Clustering Sensorik Vorgabe.xlsx (no longer hardcoded — edits to the
+# Excel propagate automatically). conc = per-recipe Totalmenge-normalized amount
+# of the marker CAS in that recipe.
 #   mode 'threshold' : marker conc > thr        (rule text '> X eindeutig')
-#   mode 'all'       : ALL markers present > 0   ('alle drei' / 'beide ... müssen')
+#   mode 'all'       : ALL markers present > 0   ('alle drei' / 'beide ... müssen vorhanden')
 #   mode 'any'       : ANY marker present > 0    ('wenn Rohstoff vorhanden')
-# tier = precedence (1 strongest). 'green' and 'unpleasant/Hexansäure' carry
-# 'keine eindeutige Regel gefunden' -> no rule, centroid fallback only.
-RULES = [
-    # tier 1 — 'eindeutig' concentration thresholds
-    {'cluster': 'unpleasant', 'mode': 'threshold', 'cas': ['75-18-3'],   'thr': 0.0009, 'tier': 1, 'note': 'Dimethylsulfid >0.0009 eindeutig'},
-    {'cluster': 'fruity',     'mode': 'threshold', 'cas': ['3025-30-7'], 'thr': 0.004,  'tier': 1, 'note': 'Ethyl-2,4-decadienoat >0.004 eindeutig'},
-    {'cluster': 'fruity',     'mode': 'threshold', 'cas': ['123-92-2'],  'thr': 0.1,    'tier': 1, 'note': 'Isoamylacetat >0.1 eindeutig'},
-    # tier 2 — multi-ingredient AND rules
-    {'cluster': 'warm',         'mode': 'all', 'cas': ['118-71-8', '3658-77-3', '121-33-5'], 'tier': 2, 'note': 'maltol+Furaneol+Vanillin (alle drei)'},
-    {'cluster': 'Walderdbeere', 'mode': 'all', 'cas': ['134-20-3', '85-91-6'],              'tier': 2, 'note': 'Methyl-+Dimethylanthranilat (beide)'},
-    {'cluster': 'dairy',        'mode': 'all', 'cas': ['431-03-8', '513-86-0'],             'tier': 2, 'note': 'diacetyl+Acetoin (beide)'},
-    # tier 3 — single-presence rules ('wenn Rohstoff vorhanden')
-    {'cluster': 'floral',     'mode': 'any', 'cas': ['8022-96-6'],               'tier': 3, 'note': 'Jasmin-Absolue vorhanden'},
-    {'cluster': 'warm',       'mode': 'any', 'cas': ['25152-84-5'],              'tier': 3, 'note': 'trans,trans-2,4-Decadienal vorhanden'},
-    {'cluster': 'unpleasant', 'mode': 'any', 'cas': ['2432-51-1', '13532-18-8'], 'tier': 3, 'note': 'S-Methylthio-butyrat/-propionat vorhanden (Black List)'},
-]
+# tier = precedence (1 strongest): threshold=1, all=2, any=3.
+# 'keine eindeutige Regel gefunden' / blank -> no rule, centroid fallback only.
+import re
+
+def _parse_thr(text):
+    \"\"\"Parse a German-decimal threshold like '> 0,0009' / '>0.004' -> float.\"\"\"
+    m = re.search(r'>\\s*([0-9]+[.,][0-9]+)', text)
+    return float(m.group(1).replace(',', '.')) if m else None
+
+def build_rules(edf):
+    \"\"\"Build M2 rule dicts from the ordered expert rows.
+
+    A rule-bearing 'all'/'any' row absorbs the following same-cluster rows whose
+    Regeln cell is blank into its marker set (so 'alle drei'/'beide' reconstruct
+    the full AND group). Threshold rules apply to their own CAS only.\"\"\"
+    rows = edf.reset_index(drop=True)
+    n = len(rows)
+    rules, i = [], 0
+    while i < n:
+        row = rows.iloc[i]
+        cluster = row['Cluster']
+        cas = str(row['CAS-Nr.']).strip() if pd.notna(row['CAS-Nr.']) else None
+        regeln = row['Regeln/ Notizen']
+        text = '' if pd.isna(regeln) else str(regeln).strip()
+        low = text.lower()
+        if not text or 'keine eindeutige' in low or cas is None:
+            i += 1
+            continue
+        thr = _parse_thr(text)
+        if thr is not None:
+            rules.append({'cluster': cluster, 'mode': 'threshold', 'cas': [cas],
+                          'thr': thr, 'tier': 1, 'note': f'{cluster}: {text}'})
+            i += 1
+            continue
+        if 'müssen vorhanden' in low or 'alle ' in low or 'beide' in low:
+            mode, tier = 'all', 2
+        elif 'vorhanden' in low:                       # 'wenn Rohstoff vorhanden'
+            mode, tier = 'any', 3
+        else:
+            i += 1                                     # unrecognized note -> ignore
+            continue
+        group_cas, j = [cas], i + 1
+        while j < n:                                   # absorb blank-rule same-cluster rows
+            nrow = rows.iloc[j]
+            if nrow['Cluster'] != cluster:
+                break
+            nreg = nrow['Regeln/ Notizen']
+            if pd.notna(nreg) and str(nreg).strip():
+                break
+            if pd.notna(nrow['CAS-Nr.']):
+                group_cas.append(str(nrow['CAS-Nr.']).strip())
+            j += 1
+        rules.append({'cluster': cluster, 'mode': mode, 'cas': group_cas,
+                      'tier': tier, 'note': f'{cluster}: {text}'})
+        i = j
+    return rules
+
+RULES = build_rules(expert_df)
+print(f'Parsed {len(RULES)} M2 rules from Vorgabe Excel:')
+for r in sorted(RULES, key=lambda r: (r['tier'], r['cluster'])):
+    extra = f" thr={r['thr']}" if 'thr' in r else ''
+    print(f"  tier{r['tier']} {r['mode']:9s} {r['cluster']:14s} cas={r['cas']}{extra}")
 
 # Precompute per-recipe normalized concentration for every marker CAS.
 _marker_cas = {c for rule in RULES for c in rule['cas']}
@@ -1264,6 +1311,111 @@ print('\\nCluster sizes per strategy representative:')
 for col_name, lbl in representative.items():
     sizes = {c: int((lbl == c).sum()) for c in sorted(set(lbl))}
     print(f'  {col_name:26s}  {sizes}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 13a. Re-score vs the sensory panel (Verkostung) — old vs new M1/M2
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """## 13a. Re-score against the Verkostung panel — old vs new M1/M2
+
+The updated `Erdbeer Clustering Sensorik Vorgabe.xlsx` changed the rules (notably
+**Dimethylsulfid 75-18-3 now maps to `warm`**, previously `unpleasant`). This cell
+compares the **new** M1/M2 assignments against the **previous run** (the
+`Fred M1/M2` columns) recorded in `Verkostung Cluster KI vom 11_06_2026.xlsx`.
+
+**Important caveat:** the panel agreement % (`Prozent %`) was judged against the
+*old* placements — "is the aroma right in the cluster it was given". It therefore
+**cannot be recomputed** for the new labels without re-tasting. We use it only to
+read intent: a *changed* assignment where the panel **disagreed** with the old
+placement (low %) is a **potential fix**; a change where the panel **agreed** with
+the old placement (high %) is a **risk** worth a human look. `Jan Free Sorting` and
+`Cluster vorgegeben` are free-text descriptors (not cluster labels), so they are
+shown for reference only — mapping them to clusters is the deferred keyword step."""))
+
+CELLS.append(code(
+    """VERK_XLSX = '../data/gold/Verkostung Cluster KI vom 11_06_2026.xlsx'
+
+# Ergebnisse sheet has the cleanest old labels + panel %. Positional columns:
+# 0 Rezept Nr | 2 old M1 | 3 old M2 | 4 Cluster vorgegeben | 5 Jan Free Sorting | 7 Prozent %
+_erg = pd.read_excel(VERK_XLSX, sheet_name='Ergebnisse', header=None)
+_erg = _erg.iloc[2:].reset_index(drop=True)          # drop the 2 header rows
+
+def _norm_cluster(x):
+    \"\"\"Pull the canonical EXPERT_CLUSTER out of a possibly-annotated label.\"\"\"
+    if pd.isna(x):
+        return ''
+    s = str(x).strip().lower()
+    for c in EXPERT_CLUSTERS:
+        if c.lower() in s:
+            return c
+    return str(x).strip()
+
+def _match_verk(rid, recipes):
+    \"\"\"Map a Verkostung id ('187.796P') to a dataset recipe.\"\"\"
+    rid = str(rid).strip()
+    if rid in recipes:
+        return rid
+    pref = [r for r in recipes if r.startswith(rid)]
+    if pref:
+        return pref[0]
+    num = rid.rstrip('PpHhNnXx ')                     # strip trailing letter suffixes
+    pref = [r for r in recipes if r.startswith(num)]
+    return pref[0] if pref else None
+
+new_m1 = {recipes[i]: direct_results['M1_label_prop'][i] for i in range(len(recipes))}
+new_m2 = {recipes[i]: direct_results['M2_rule_based'][i] for i in range(len(recipes))}
+
+cmp_rows = []
+for _, r in _erg.iterrows():
+    rid = r[0]
+    if pd.isna(rid):
+        continue
+    ds = _match_verk(rid, recipes)
+    if ds is None:
+        cmp_rows.append({'Recipe': str(rid).strip(), 'matched': '(no dataset match)'})
+        continue
+    old1, old2 = _norm_cluster(r[2]), _norm_cluster(r[3])
+    n1, n2 = new_m1[ds], new_m2[ds]
+    try:
+        pct = float(r[7])
+    except (TypeError, ValueError):
+        pct = np.nan
+    def _flag(old, new):
+        if old == new or not old:
+            return ''
+        if not np.isnan(pct) and pct < 50:
+            return 'potential fix'
+        if not np.isnan(pct) and pct >= 75:
+            return 'RISK (panel liked old)'
+        return 'changed'
+    cmp_rows.append({
+        'Recipe': str(rid).strip(), 'matched': ds,
+        'old_M1': old1, 'new_M1': n1, 'M1_change': _flag(old1, n1),
+        'old_M2': old2, 'new_M2': n2, 'M2_change': _flag(old2, n2),
+        'panel_%': pct,
+        'Cluster_vorgegeben': '' if pd.isna(r[4]) else str(r[4]).strip(),
+        'Jan_Free_Sorting': '' if pd.isna(r[5]) else str(r[5]).strip(),
+    })
+
+compare_df = pd.DataFrame(cmp_rows)
+pd.set_option('display.max_rows', 100)
+print('Old vs New M1/M2 on the', len(compare_df), 'tasted recipes:')
+print(compare_df.to_string(index=False))
+
+m1_changed = compare_df['M1_change'].fillna('').ne('').sum() if 'M1_change' in compare_df else 0
+m2_changed = compare_df['M2_change'].fillna('').ne('').sum() if 'M2_change' in compare_df else 0
+print(f'\\nM1 changed assignment on {m1_changed} recipes; M2 changed on {m2_changed} recipes.')
+for col, lbl in [('M1_change', 'M1'), ('M2_change', 'M2')]:
+    if col in compare_df:
+        fixes = int((compare_df[col] == 'potential fix').sum())
+        risks = int((compare_df[col] == 'RISK (panel liked old)').sum())
+        print(f'  {lbl}: {fixes} potential fixes (panel disliked old), {risks} risks (panel liked old)')
+
+# Append the comparison as a sheet to the strategy export.
+with pd.ExcelWriter(out_xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+    compare_df.fillna('').to_excel(writer, sheet_name='Verkostung_Compare', index=False)
+print(f'\\nAppended sheet Verkostung_Compare to {out_xlsx}')
 """))
 
 # ---------------------------------------------------------------------------

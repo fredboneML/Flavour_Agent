@@ -811,6 +811,86 @@ grid. Each produces a single labeling, collected in `direct_results`:
   (excluding the degenerate DEC / Fuzzy c-Means) plus M1, clustered at k=7.
 """))
 
+# ── Keyword signal (from Verkostung Übersicht 'fertige Aromen') ──────────────
+CELLS.append(md(
+    """### 7b.0  Keyword signal (soft, confidence-gated)
+
+The `Key-Words Übersicht fertige Aromen` column of
+`Verkostung Cluster KI vom 11_06_2026.xlsx` carries recipe-level sensory
+descriptors. We map the **discriminative** German words to expert clusters
+(`KW_LEXICON`); generic words that appear across every cluster
+(`fruchtig`, `bonbonartig`, `reif`, `saftig`, `süß`, `erdbeere`) are
+deliberately excluded. Per recipe we count cluster hits and keep a **confident
+vote** only when the top cluster leads the runner-up by ≥1.
+
+This vote is a *soft* signal used by the `M1_kw` / `M2_kw` variants below — the
+hard chemistry rules from the Vorgabe stay authoritative. Keywords exist for
+only the tasted subset, so recipes without a confident vote keep their original
+(rule / centroid / propagation) assignment. Note: these descriptors come from
+the same finished aromas the panel later tasted, so treat panel-agreement gains
+as suggestive, not independent proof."""))
+
+CELLS.append(code(
+    """import re
+VERK_XLSX = '../data/gold/Verkostung Cluster KI vom 11_06_2026.xlsx'
+
+# Discriminative German descriptor -> expert cluster. Generic tokens omitted.
+KW_LEXICON = {
+    'karamell': 'warm', 'marmelade': 'warm',
+    'grün': 'green', 'frisch': 'green',
+    'blumig': 'floral',
+    'sahnig': 'dairy', 'milchig': 'dairy', 'buttrig': 'dairy',
+    'überreif': 'unpleasant', 'bier': 'unpleasant', 'holzig': 'unpleasant',
+    'mango': 'fruity', 'tutti-frutti': 'fruity',
+    'walderdbeere': 'Walderdbeere',
+}
+KW_MARGIN = 1   # top cluster must lead the runner-up by >= this to count as a vote
+
+_ub = pd.read_excel(VERK_XLSX, sheet_name='Übersicht')
+_kwcol = [c for c in _ub.columns if 'Key-Words' in str(c)][0]
+_ridcol = _ub.columns[0]
+
+def _match_kw(rid, recipes):
+    rid = str(rid).strip()
+    if rid in recipes:
+        return rid
+    pref = [r for r in recipes if r.startswith(rid)]
+    if pref:
+        return pref[0]
+    num = rid.rstrip('PpHhNnXxKk ')
+    pref = [r for r in recipes if r.startswith(num)]
+    return pref[0] if pref else None
+
+kw_scores = {}   # recipe -> {cluster: hit count}
+for _, row in _ub.iterrows():
+    rid, kws = row[_ridcol], row[_kwcol]
+    if pd.isna(rid) or pd.isna(kws):
+        continue
+    ds = _match_kw(rid, recipes)
+    if ds is None:
+        continue
+    sc = kw_scores.setdefault(ds, {})
+    for tok in re.split(r'[,/]', str(kws)):
+        cl = KW_LEXICON.get(tok.strip().lower())
+        if cl:
+            sc[cl] = sc.get(cl, 0) + 1
+
+kw_vote = {}     # recipe -> cluster, only when confident
+for recipe, sc in kw_scores.items():
+    if not sc:
+        continue
+    ranked = sorted(sc.items(), key=lambda kv: -kv[1])
+    top_c, top_n = ranked[0]
+    run_n = ranked[1][1] if len(ranked) > 1 else 0
+    if top_n - run_n >= KW_MARGIN:
+        kw_vote[recipe] = top_c
+
+print(f'Keyword signal: {len(kw_scores)} recipes have mapped keywords, '
+      f'{len(kw_vote)} give a confident vote (margin >= {KW_MARGIN}).')
+for recipe in sorted(kw_vote):
+    print(f'  {recipe:12s} -> {kw_vote[recipe]:14s}  (scores {kw_scores[recipe]})')
+"""))
+
 # ── M1: Label Propagation ────────────────────────────────────────────────────
 CELLS.append(code(
     """from sklearn.semi_supervised import LabelSpreading
@@ -978,6 +1058,75 @@ print('\\n  Audit — recipes assigned by an expert rule:')
 for recipe, src, cl, reason in audit:
     if src != 'centroid':
         print(f'    {recipe:12s}  [{src}]  -> {cl:14s}  ({reason})')
+"""))
+
+# ── M1_kw / M2_kw: keyword-enhanced variants ─────────────────────────────────
+CELLS.append(md(
+    """### 7b.1  Keyword-enhanced variants (`M1_kw`, `M2_kw`)
+
+Same machinery as M1/M2, plus the confident keyword vote — added **alongside**
+the originals so we can measure whether keywords help (see the
+`Verkostung_Compare` sheet). Rules stay authoritative:
+
+- **`M1_kw`** = M1 with extra seed labels from `kw_vote` (only where a recipe is
+  not already a pinned target), so propagation is pulled toward keyword evidence.
+- **`M2_kw`** = M2 where the keyword vote replaces nearest-centroid for the
+  *no-rule fallback* and breaks *same-tier rule ties*; rule-fired assignments are
+  untouched."""))
+
+CELLS.append(code(
+    """# M1_kw — M1 plus confident keyword seeds (does not override target seeds).
+seed_kw = seed_labels.copy()
+added = 0
+for recipe, cl in kw_vote.items():
+    i = recipes.index(recipe)
+    if seed_kw[i] < 0:
+        seed_kw[i] = cluster_to_int[cl]
+        added += 1
+ls_kw = LabelSpreading(kernel='knn', n_neighbors=10, alpha=0.2, max_iter=1000)
+ls_kw.fit(vecs, seed_kw)
+direct_results['M1_kw'] = np.array([int_to_cluster[i] for i in ls_kw.transduction_])
+diff1 = int((direct_results['M1_kw'] != direct_results['M1_label_prop']).sum())
+print(f'M1_kw: +{added} keyword seeds ({int((seed_kw>=0).sum())} total); '
+      f'differs from M1 on {diff1} recipes')
+print('  sizes:', {c: int((direct_results['M1_kw'] == c).sum()) for c in EXPERT_CLUSTERS})
+
+# M2_kw — keyword vote for no-rule fallback and same-tier ties; rules authoritative.
+# Expert target/anchor recipes are never overridden by a keyword (same guard as M1_kw).
+_target_set = {r for s in expert_spec.values() for r in s.get('target_recipes_resolved', [])}
+m2kw_labels, audit_kw = [], []
+for ri, recipe in enumerate(recipes):
+    fired = fired_rules(recipe)
+    vote = None if recipe in _target_set else kw_vote.get(recipe)
+    if fired:
+        best_tier = min(r['tier'] for r in fired)
+        cand_clusters = sorted({r['cluster'] for r in fired if r['tier'] == best_tier})
+        if len(cand_clusters) == 1:
+            chosen, reason = cand_clusters[0], 'rule'
+        elif vote in cand_clusters:
+            chosen, reason = vote, f'tie@tier{best_tier} {cand_clusters} -> keyword'
+        else:
+            v = vecs[ri]
+            sims = {c: (float(v @ s1_centroids[c]) if s1_centroids.get(c) is not None else -1.0)
+                    for c in cand_clusters}
+            chosen, reason = max(sims, key=sims.get), f'tie@tier{best_tier} -> cosine'
+    elif vote is not None:
+        chosen, reason = vote, 'no rule -> keyword'
+    else:
+        v = vecs[ri]
+        sims = {c: float(v @ cv) for c, cv in s1_centroids.items() if cv is not None}
+        chosen, reason = max(sims, key=sims.get), 'no rule -> nearest centroid'
+    m2kw_labels.append(chosen)
+    audit_kw.append((recipe, chosen, reason))
+
+direct_results['M2_kw'] = np.array(m2kw_labels)
+diff2 = int((direct_results['M2_kw'] != direct_results['M2_rule_based']).sum())
+print(f'M2_kw: differs from M2 on {diff2} recipes')
+print('  sizes:', {c: int((direct_results['M2_kw'] == c).sum()) for c in EXPERT_CLUSTERS})
+print('  keyword-driven assignments:')
+for recipe, cl, reason in audit_kw:
+    if 'keyword' in reason:
+        print(f'    {recipe:12s} -> {cl:14s} ({reason})')
 """))
 
 # ── M3: Consensus clustering ─────────────────────────────────────────────────
@@ -1154,13 +1303,21 @@ CELLS.append(md("## 11e. Direct Methods - MDS comparison (M1 / M2 / M3)\n"))
 CELLS.append(code(
     """_methods = [('M1_label_prop', 'M1: Label Propagation'),
             ('M2_rule_based', 'M2: Rule-based'),
-            ('M3_consensus',  'M3: Consensus')]
+            ('M3_consensus',  'M3: Consensus'),
+            ('M1_kw',         'M1_kw: + keyword seeds'),
+            ('M2_kw',         'M2_kw: + keyword vote')]
 
-fig, axes = plt.subplots(1, 3, figsize=(6.5 * 3, 5.5))
+_nm = len(_methods)
+_cols = 3
+_rows = -(-_nm // _cols)
+fig, axes = plt.subplots(_rows, _cols, figsize=(6.5 * _cols, 5.5 * _rows))
+axes = np.atleast_1d(axes).flatten()
 for ax, (key, title) in zip(axes, _methods):
     lbl = direct_results[key]
     mds_plot_named(ax, mds_coords, recipes, lbl,
                    f'{title}  ({len(set(lbl))} clusters)', show_legend=True)
+for j in range(_nm, len(axes)):
+    axes[j].set_visible(False)
 fig.suptitle(f'Direct Methods (Erdbeere, n={len(recipes)}, k={K_EXPERT}, expert-seeded)',
              fontsize=13, fontweight='bold', y=1.02)
 plt.tight_layout()
@@ -1365,6 +1522,8 @@ def _match_verk(rid, recipes):
 
 new_m1 = {recipes[i]: direct_results['M1_label_prop'][i] for i in range(len(recipes))}
 new_m2 = {recipes[i]: direct_results['M2_rule_based'][i] for i in range(len(recipes))}
+new_m1kw = {recipes[i]: direct_results['M1_kw'][i] for i in range(len(recipes))}
+new_m2kw = {recipes[i]: direct_results['M2_kw'][i] for i in range(len(recipes))}
 
 cmp_rows = []
 for _, r in _erg.iterrows():
@@ -1392,7 +1551,10 @@ for _, r in _erg.iterrows():
     cmp_rows.append({
         'Recipe': str(rid).strip(), 'matched': ds,
         'old_M1': old1, 'new_M1': n1, 'M1_change': _flag(old1, n1),
+        'M1_kw': new_m1kw[ds], 'M1kw_vs_M1': '*' if new_m1kw[ds] != n1 else '',
         'old_M2': old2, 'new_M2': n2, 'M2_change': _flag(old2, n2),
+        'M2_kw': new_m2kw[ds], 'M2kw_vs_M2': '*' if new_m2kw[ds] != n2 else '',
+        'kw_vote': kw_vote.get(ds, ''),
         'panel_%': pct,
         'Cluster_vorgegeben': '' if pd.isna(r[4]) else str(r[4]).strip(),
         'Jan_Free_Sorting': '' if pd.isna(r[5]) else str(r[5]).strip(),
@@ -1411,6 +1573,11 @@ for col, lbl in [('M1_change', 'M1'), ('M2_change', 'M2')]:
         fixes = int((compare_df[col] == 'potential fix').sum())
         risks = int((compare_df[col] == 'RISK (panel liked old)').sum())
         print(f'  {lbl}: {fixes} potential fixes (panel disliked old), {risks} risks (panel liked old)')
+
+m1kw_d = int(compare_df['M1kw_vs_M1'].eq('*').sum()) if 'M1kw_vs_M1' in compare_df else 0
+m2kw_d = int(compare_df['M2kw_vs_M2'].eq('*').sum()) if 'M2kw_vs_M2' in compare_df else 0
+print(f'\\nKeyword variants on the tasted recipes: M1_kw differs from M1 on {m1kw_d}, '
+      f'M2_kw differs from M2 on {m2kw_d} (marked * in the M1kw_vs_M1 / M2kw_vs_M2 columns).')
 
 # Append the comparison as a sheet to the strategy export.
 with pd.ExcelWriter(out_xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:

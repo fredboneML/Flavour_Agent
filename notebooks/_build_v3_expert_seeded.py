@@ -1026,8 +1026,22 @@ def fired_rules(recipe):
     return out
 
 s1_centroids = STRATEGIES['S1_target_recipes']
+
+# Anchor guard: expert target recipes are the exemplars that DEFINE each cluster,
+# so they are pinned to their intended cluster and never reassigned by a rule
+# (same anchoring M1 uses). This resolves rule/anchor conflicts such as the
+# unpleasant anchor 185.267 (2nd-highest DMS → would fire warm) and the fruity
+# anchor 187.772. Non-target recipes go through the normal rule cascade.
+target_to_cluster = {r: c for c, s in expert_spec.items()
+                     for r in s.get('target_recipes_resolved', [])}
+
 m2_labels, audit = [], []
 for ri, recipe in enumerate(recipes):
+    if recipe in target_to_cluster:
+        chosen = target_to_cluster[recipe]
+        m2_labels.append(chosen)
+        audit.append((recipe, 'anchor', chosen, 'expert target recipe (pinned)'))
+        continue
     fired = fired_rules(recipe)
     if fired:
         best_tier = min(r['tier'] for r in fired)
@@ -1052,8 +1066,10 @@ for ri, recipe in enumerate(recipes):
         audit.append((recipe, 'centroid', chosen, 'no rule fired'))
 
 direct_results['M2_rule_based'] = np.array(m2_labels)
-n_rule = sum(1 for a in audit if a[1] != 'centroid')
-print(f'M2 Rule-based: {n_rule}/{len(recipes)} assigned by rule, {len(recipes)-n_rule} by nearest centroid')
+n_anchor = sum(1 for a in audit if a[1] == 'anchor')
+n_rule = sum(1 for a in audit if a[1] not in ('centroid', 'anchor'))
+n_cent = sum(1 for a in audit if a[1] == 'centroid')
+print(f'M2 Rule-based: {n_anchor} anchors pinned, {n_rule} assigned by rule, {n_cent} by nearest centroid')
 print('  sizes:', {c: int((direct_results['M2_rule_based'] == c).sum()) for c in EXPERT_CLUSTERS})
 print('\\n  Audit — recipes assigned by an expert rule:')
 for recipe, src, cl, reason in audit:
@@ -1082,12 +1098,15 @@ to M2 by design."""))
 
 CELLS.append(code(
     """# M2_kw — keyword vote for no-rule fallback and same-tier ties; rules authoritative.
-# Expert target/anchor recipes are never overridden by a keyword (same guard as M1_kw).
-_target_set = {r for s in expert_spec.values() for r in s.get('target_recipes_resolved', [])}
+# Same anchor guard as M2: expert target recipes are pinned, never overridden.
 m2kw_labels, audit_kw = [], []
 for ri, recipe in enumerate(recipes):
+    if recipe in target_to_cluster:
+        m2kw_labels.append(target_to_cluster[recipe])
+        audit_kw.append((recipe, target_to_cluster[recipe], 'anchor (pinned)'))
+        continue
     fired = fired_rules(recipe)
-    vote = None if recipe in _target_set else kw_vote.get(recipe)
+    vote = kw_vote.get(recipe)
     if fired:
         best_tier = min(r['tier'] for r in fired)
         cand_clusters = sorted({r['cluster'] for r in fired if r['tier'] == best_tier})

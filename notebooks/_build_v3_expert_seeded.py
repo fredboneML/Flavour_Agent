@@ -844,7 +844,8 @@ KW_LEXICON = {
     'mango': 'fruity', 'tutti-frutti': 'fruity',
     'walderdbeere': 'Walderdbeere',
 }
-KW_MARGIN = 1   # top cluster must lead the runner-up by >= this to count as a vote
+KW_MARGIN = 2   # top cluster must lead the runner-up by >= this to count as a vote
+                # (>=2 = at least two agreeing keywords; filters noisy single-word votes)
 
 _ub = pd.read_excel(VERK_XLSX, sheet_name='Übersicht')
 _kwcol = [c for c in _ub.columns if 'Key-Words' in str(c)][0]
@@ -1062,36 +1063,25 @@ for recipe, src, cl, reason in audit:
 
 # ── M1_kw / M2_kw: keyword-enhanced variants ─────────────────────────────────
 CELLS.append(md(
-    """### 7b.1  Keyword-enhanced variants (`M1_kw`, `M2_kw`)
+    """### 7b.1  Keyword-enhanced variant (`M2_kw`)
 
-Same machinery as M1/M2, plus the confident keyword vote — added **alongside**
-the originals so we can measure whether keywords help (see the
-`Verkostung_Compare` sheet). Rules stay authoritative:
+Same machinery as M2, plus the confident keyword vote — added **alongside** the
+original so we can measure whether keywords help (see the `Verkostung_Compare`
+sheet). Rules stay authoritative:
 
-- **`M1_kw`** = M1 with extra seed labels from `kw_vote` (only where a recipe is
-  not already a pinned target), so propagation is pulled toward keyword evidence.
 - **`M2_kw`** = M2 where the keyword vote replaces nearest-centroid for the
-  *no-rule fallback* and breaks *same-tier rule ties*; rule-fired assignments are
-  untouched."""))
+  *no-rule fallback* and breaks *same-tier rule ties*; rule-fired assignments and
+  expert target/anchor recipes are untouched.
+
+An earlier `M1_kw` (label-propagation with keyword seeds) was dropped: even 8
+seeds swung 27 of 130 labels and collapsed real clusters (Walderdbeere, unpleasant),
+so the propagation channel proved too noisy. With the gate raised to
+`KW_MARGIN = 2` (two agreeing keywords) only a handful of high-confidence votes
+remain — most of which the chemistry rules already cover, so M2_kw stays close
+to M2 by design."""))
 
 CELLS.append(code(
-    """# M1_kw — M1 plus confident keyword seeds (does not override target seeds).
-seed_kw = seed_labels.copy()
-added = 0
-for recipe, cl in kw_vote.items():
-    i = recipes.index(recipe)
-    if seed_kw[i] < 0:
-        seed_kw[i] = cluster_to_int[cl]
-        added += 1
-ls_kw = LabelSpreading(kernel='knn', n_neighbors=10, alpha=0.2, max_iter=1000)
-ls_kw.fit(vecs, seed_kw)
-direct_results['M1_kw'] = np.array([int_to_cluster[i] for i in ls_kw.transduction_])
-diff1 = int((direct_results['M1_kw'] != direct_results['M1_label_prop']).sum())
-print(f'M1_kw: +{added} keyword seeds ({int((seed_kw>=0).sum())} total); '
-      f'differs from M1 on {diff1} recipes')
-print('  sizes:', {c: int((direct_results['M1_kw'] == c).sum()) for c in EXPERT_CLUSTERS})
-
-# M2_kw — keyword vote for no-rule fallback and same-tier ties; rules authoritative.
+    """# M2_kw — keyword vote for no-rule fallback and same-tier ties; rules authoritative.
 # Expert target/anchor recipes are never overridden by a keyword (same guard as M1_kw).
 _target_set = {r for s in expert_spec.values() for r in s.get('target_recipes_resolved', [])}
 m2kw_labels, audit_kw = [], []
@@ -1304,7 +1294,6 @@ CELLS.append(code(
     """_methods = [('M1_label_prop', 'M1: Label Propagation'),
             ('M2_rule_based', 'M2: Rule-based'),
             ('M3_consensus',  'M3: Consensus'),
-            ('M1_kw',         'M1_kw: + keyword seeds'),
             ('M2_kw',         'M2_kw: + keyword vote')]
 
 _nm = len(_methods)
@@ -1522,7 +1511,6 @@ def _match_verk(rid, recipes):
 
 new_m1 = {recipes[i]: direct_results['M1_label_prop'][i] for i in range(len(recipes))}
 new_m2 = {recipes[i]: direct_results['M2_rule_based'][i] for i in range(len(recipes))}
-new_m1kw = {recipes[i]: direct_results['M1_kw'][i] for i in range(len(recipes))}
 new_m2kw = {recipes[i]: direct_results['M2_kw'][i] for i in range(len(recipes))}
 
 cmp_rows = []
@@ -1551,7 +1539,6 @@ for _, r in _erg.iterrows():
     cmp_rows.append({
         'Recipe': str(rid).strip(), 'matched': ds,
         'old_M1': old1, 'new_M1': n1, 'M1_change': _flag(old1, n1),
-        'M1_kw': new_m1kw[ds], 'M1kw_vs_M1': '*' if new_m1kw[ds] != n1 else '',
         'old_M2': old2, 'new_M2': n2, 'M2_change': _flag(old2, n2),
         'M2_kw': new_m2kw[ds], 'M2kw_vs_M2': '*' if new_m2kw[ds] != n2 else '',
         'kw_vote': kw_vote.get(ds, ''),
@@ -1574,10 +1561,9 @@ for col, lbl in [('M1_change', 'M1'), ('M2_change', 'M2')]:
         risks = int((compare_df[col] == 'RISK (panel liked old)').sum())
         print(f'  {lbl}: {fixes} potential fixes (panel disliked old), {risks} risks (panel liked old)')
 
-m1kw_d = int(compare_df['M1kw_vs_M1'].eq('*').sum()) if 'M1kw_vs_M1' in compare_df else 0
 m2kw_d = int(compare_df['M2kw_vs_M2'].eq('*').sum()) if 'M2kw_vs_M2' in compare_df else 0
-print(f'\\nKeyword variants on the tasted recipes: M1_kw differs from M1 on {m1kw_d}, '
-      f'M2_kw differs from M2 on {m2kw_d} (marked * in the M1kw_vs_M1 / M2kw_vs_M2 columns).')
+print(f'\\nKeyword variant on the tasted recipes: M2_kw differs from M2 on {m2kw_d} '
+      f'(marked * in the M2kw_vs_M2 column).')
 
 # Append the comparison as a sheet to the strategy export.
 with pd.ExcelWriter(out_xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:

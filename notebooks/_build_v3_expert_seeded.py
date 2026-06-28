@@ -1591,6 +1591,112 @@ print(f'\\nAppended sheet Verkostung_Compare to {out_xlsx}')
 """))
 
 # ---------------------------------------------------------------------------
+# 13a.1 Objective panel scorecard (accuracy vs panel ground truth)
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """### 13a.1  Objective panel scorecard
+
+`Verkostung_Compare` shows *what changed*; this cell scores *whether it's right*
+against the panel's own verdicts in the `Auswertung` sheet. Each tasted recipe
+gets a **confident ground-truth cluster** only when the panel signal is
+unambiguous:
+
+- **endorsed** — ≥3 of 4 panelists said the placement was right **and** M1==M2
+  (so the cluster they judged is unambiguous) → GT = that cluster.
+- **corrected** — ≥2 panelists who said "wrong" name the *same* alternative
+  cluster → GT = that cluster.
+- otherwise **contested** → excluded from scoring and listed for the expert.
+
+Panel free-text is mapped to clusters with an evaluation-only lexicon
+(`muffig→unpleasant`, `buttrig→dairy`, …). **Caveat:** the Verkostung does not
+record which single cluster a recipe was shown in when M1≠M2, so those recipes
+cannot fairly score either method — they are reported as "needs re-taste"."""))
+
+CELLS.append(code(
+    """from collections import Counter
+
+# Evaluation-only mapping of panel free-text -> expert cluster.
+_PANEL_MAP = {
+    'warm': 'warm', 'karamell': 'warm', 'marmelade': 'warm',
+    'green': 'green', 'grün': 'green', 'frisch': 'green',
+    'floral': 'floral', 'blumig': 'floral', 'jasmin': 'floral',
+    'dairy': 'dairy', 'sahnig': 'dairy', 'milchig': 'dairy', 'buttrig': 'dairy', 'joghurt': 'dairy',
+    'unpleasant': 'unpleasant', 'muffig': 'unpleasant', 'überreif': 'unpleasant',
+    'bier': 'unpleasant', 'skatol': 'unpleasant', 'fenchel': 'unpleasant',
+    'fruity': 'fruity', 'mango': 'fruity', 'banane': 'fruity', 'apfel': 'fruity',
+    'mandarine': 'fruity', 'birne': 'fruity', 'marille': 'fruity',
+    'walderdbeere': 'Walderdbeere',
+}
+def _panel_norm(x):
+    if pd.isna(x):
+        return None
+    s = str(x).strip().lower()
+    for k, v in _PANEL_MAP.items():
+        if k in s:
+            return v
+    return None  # 'Outlayer' / unknown -> abstain
+
+_au = pd.read_excel(VERK_XLSX, sheet_name='Auswertung', header=None).iloc[3:31].reset_index(drop=True)
+_blocks = [(6, 8), (10, 12), (14, 16), (18, 20)]   # (richtig?, wenn-nein-cluster) per panelist
+
+new_lbl = {recipes[i]: (direct_results['M1_label_prop'][i],
+                        direct_results['M2_rule_based'][i],
+                        direct_results['M2_kw'][i]) for i in range(len(recipes))}
+
+score = {'M1': [0, 0], 'M2': [0, 0], 'M2_kw': [0, 0]}
+scored_rows, retaste_rows = [], []
+for _, r in _au.iterrows():
+    rid = str(r[0]).strip()
+    if rid == 'nan' or not rid:
+        continue
+    ds = _match_verk(rid, recipes)
+    if ds is None:
+        continue
+    n_yes, sugg = 0, []
+    for ja_c, sug_c in _blocks:
+        if str(r[ja_c]).strip().lower() in ('true', 'wahr', 'ja'):
+            n_yes += 1
+        else:
+            c = _panel_norm(r[sug_c])
+            if c:
+                sugg.append(c)
+    m1, m2, m2kw = new_lbl[ds]
+    maj = Counter(sugg).most_common(1)[0] if sugg else None
+    if n_yes >= 3 and m1 == m2:          # 3/4 endorse the placement; lone dissenter ignored
+        gt, src = m1, 'endorsed'
+    elif maj and maj[1] >= 2:
+        gt, src = maj[0], 'corrected'
+    else:
+        retaste_rows.append({'Recipe': rid, 'panel_%': n_yes * 25,
+                             'M1': m1, 'M2': m2, 'M2_kw': m2kw,
+                             'reason': 'M1≠M2 (cluster shown unknown)' if m1 != m2 else 'panel split'})
+        continue
+    row = {'Recipe': rid, 'GT': gt, 'src': src}
+    for m, lab in [('M1', m1), ('M2', m2), ('M2_kw', m2kw)]:
+        ok = (lab == gt)
+        score[m][0] += ok
+        score[m][1] += 1
+        row[m] = f'{lab} {"✓" if ok else "✗"}'
+    scored_rows.append(row)
+
+print('Accuracy vs confident panel ground truth:')
+for m in ['M1', 'M2', 'M2_kw']:
+    h, t = score[m]
+    print(f'  {m:6s}: {h}/{t} = {100*h/t:.0f}%' if t else f'  {m}: n/a')
+print(f'\\nScored on {score["M2"][1]} confident recipes; '
+      f'{len(retaste_rows)} contested/ambiguous (excluded).')
+print('\\nScored recipes:')
+print(pd.DataFrame(scored_rows).to_string(index=False))
+print('\\nNeeds expert re-taste (no usable ground truth):')
+print(pd.DataFrame(retaste_rows).to_string(index=False))
+
+with pd.ExcelWriter(out_xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+    pd.DataFrame(scored_rows).to_excel(writer, sheet_name='Panel_Scorecard', index=False)
+    pd.DataFrame(retaste_rows).to_excel(writer, sheet_name='Needs_Retaste', index=False)
+print(f'\\nAppended sheets Panel_Scorecard + Needs_Retaste to {out_xlsx}')
+"""))
+
+# ---------------------------------------------------------------------------
 # 13b. Strategy_Comparison overview plots
 # ---------------------------------------------------------------------------
 CELLS.append(md(

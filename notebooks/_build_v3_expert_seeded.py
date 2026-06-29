@@ -1644,7 +1644,7 @@ new_lbl = {recipes[i]: (direct_results['M1_label_prop'][i],
                         direct_results['M2_kw'][i]) for i in range(len(recipes))}
 
 score = {'M1': [0, 0], 'M2': [0, 0], 'M2_kw': [0, 0]}
-scored_rows, retaste_rows = [], []
+scored_rows, retaste_rows, panel_eval = [], [], []
 for _, r in _au.iterrows():
     rid = str(r[0]).strip()
     if rid == 'nan' or not rid:
@@ -1667,9 +1667,12 @@ for _, r in _au.iterrows():
     elif maj and maj[1] >= 2:
         gt, src = maj[0], 'corrected'
     else:
+        status = 'retaste' if m1 != m2 else 'split'
         retaste_rows.append({'Recipe': rid, 'panel_%': n_yes * 25,
                              'M1': m1, 'M2': m2, 'M2_kw': m2kw,
                              'reason': 'M1≠M2 (cluster shown unknown)' if m1 != m2 else 'panel split'})
+        panel_eval.append({'Recipe': rid, 'M1': m1, 'M2': m2, 'M2_kw': m2kw,
+                           'GT': None, 'status': status, 'panel_%': n_yes * 25})
         continue
     row = {'Recipe': rid, 'GT': gt, 'src': src}
     for m, lab in [('M1', m1), ('M2', m2), ('M2_kw', m2kw)]:
@@ -1678,6 +1681,8 @@ for _, r in _au.iterrows():
         score[m][1] += 1
         row[m] = f'{lab} {"✓" if ok else "✗"}'
     scored_rows.append(row)
+    panel_eval.append({'Recipe': rid, 'M1': m1, 'M2': m2, 'M2_kw': m2kw,
+                       'GT': gt, 'status': 'scored', 'panel_%': n_yes * 25})
 
 print('Accuracy vs confident panel ground truth:')
 for m in ['M1', 'M2', 'M2_kw']:
@@ -1694,6 +1699,99 @@ with pd.ExcelWriter(out_xlsx, engine='openpyxl', mode='a', if_sheet_exists='repl
     pd.DataFrame(scored_rows).to_excel(writer, sheet_name='Panel_Scorecard', index=False)
     pd.DataFrame(retaste_rows).to_excel(writer, sheet_name='Needs_Retaste', index=False)
 print(f'\\nAppended sheets Panel_Scorecard + Needs_Retaste to {out_xlsx}')
+"""))
+
+# ---------------------------------------------------------------------------
+# 13a.2 Panel summary grid (one figure for the expert e-mail)
+# ---------------------------------------------------------------------------
+CELLS.append(md(
+    """### 13a.2  Panel summary grid
+
+One at-a-glance figure: rows = the 28 tasted recipes (grouped **scored →
+re-taste (M1≠M2) → panel split**), columns = M1 / M2 / M2_kw / Panel GT, each
+cell colored by the assigned cluster. For scored recipes a ✓/✗ marks agreement
+with the panel ground truth. Saved as a PNG and embedded into the export
+workbook as the `Summary_Grid` sheet."""))
+
+CELLS.append(code(
+    """from matplotlib.colors import ListedColormap
+from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
+
+_order = {'scored': 0, 'retaste': 1, 'split': 2}
+pe = sorted(panel_eval, key=lambda d: (_order[d['status']], d['GT'] or 'zzz', d['Recipe']))
+cols = ['M1', 'M2', 'M2_kw', 'GT']
+col_titles = ['M1', 'M2', 'M2_kw', 'Panel GT']
+cidx = {c: i for i, c in enumerate(EXPERT_CLUSTERS)}
+short = {'warm': 'warm', 'floral': 'floral', 'Walderdbeere': 'Wald',
+         'green': 'green', 'dairy': 'dairy', 'unpleasant': 'unpl', 'fruity': 'fruity'}
+
+mat = np.full((len(pe), len(cols)), np.nan)
+for i, d in enumerate(pe):
+    for j, col in enumerate(cols):
+        if d[col] in cidx:
+            mat[i, j] = cidx[d[col]]
+
+cmap = ListedColormap([EXPERT_COLORS[c] for c in EXPERT_CLUSTERS])
+cmap.set_bad('#F0F0F0')
+
+fig, ax = plt.subplots(figsize=(7.2, 0.34 * len(pe) + 2.2))
+ax.imshow(mat, cmap=cmap, vmin=-0.5, vmax=len(EXPERT_CLUSTERS) - 0.5, aspect='auto')
+
+for i, d in enumerate(pe):
+    for j, col in enumerate(cols):
+        v = d[col]
+        if v not in cidx:
+            continue
+        txt = short.get(v, v[:4])
+        if col != 'GT' and d['status'] == 'scored' and d['GT'] is not None:
+            txt += '  ✓' if v == d['GT'] else '  ✗'
+        ax.text(j, i, txt, ha='center', va='center', fontsize=7, color='black',
+                bbox=dict(facecolor='white', alpha=0.55, edgecolor='none', pad=0.6))
+
+# Group separators between scored / retaste / split.
+prev = None
+for i, d in enumerate(pe):
+    if prev is not None and d['status'] != prev:
+        ax.axhline(i - 0.5, color='black', lw=1.6)
+    prev = d['status']
+
+ax.set_xticks(range(len(cols)))
+ax.set_xticklabels(col_titles, fontsize=9, fontweight='bold')
+ax.xaxis.set_label_position('top'); ax.xaxis.tick_top()
+ax.set_yticks(range(len(pe)))
+_statcol = {'scored': '#222222', 'retaste': '#B00020', 'split': '#888888'}
+ax.set_yticklabels([d['Recipe'] for d in pe], fontsize=7)
+for tick, d in zip(ax.get_yticklabels(), pe):
+    tick.set_color(_statcol[d['status']])
+ax.set_xlim(-0.5, len(cols) - 0.5)
+
+h, t = score['M2']
+n_ret = sum(1 for d in pe if d['status'] == 'retaste')
+n_spl = sum(1 for d in pe if d['status'] == 'split')
+fig.suptitle(f'Erdbeere panel evaluation — M1 / M2 / M2_kw vs sensory panel\\n'
+             f'scored {h}/{t} = {100*h/t:.0f}%   |   {n_ret} re-taste (M1≠M2, red)   |   '
+             f'{n_spl} panel-split (grey)',
+             fontsize=10, fontweight='bold', y=0.99)
+
+patches = [mpatches.Patch(color=EXPERT_COLORS[c], label=c) for c in EXPERT_CLUSTERS]
+ax.legend(handles=patches, fontsize=7, ncol=4, loc='upper center',
+          bbox_to_anchor=(0.5, -0.04 - 6.5 / len(pe)), framealpha=0.9)
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+
+grid_png = f'{OUTPUT_DIR}/erdbeere_v3_panel_summary_grid.png'
+plt.savefig(grid_png, dpi=150, bbox_inches='tight')
+plt.show()
+print(f'Saved: {grid_png}')
+
+# Embed the figure into the export workbook as the first sheet.
+wb = load_workbook(out_xlsx)
+if 'Summary_Grid' in wb.sheetnames:
+    del wb['Summary_Grid']
+ws = wb.create_sheet('Summary_Grid', 0)
+ws.add_image(XLImage(grid_png), 'A1')
+wb.save(out_xlsx)
+print(f'Embedded Summary_Grid sheet into {out_xlsx}')
 """))
 
 # ---------------------------------------------------------------------------

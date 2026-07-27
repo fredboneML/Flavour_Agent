@@ -91,9 +91,10 @@ def compute_scores(recipes_df: pd.DataFrame, weights: pd.DataFrame) -> pd.DataFr
 
 
 def normalize_scores(scores: pd.DataFrame) -> pd.DataFrame:
-    """Scale each recipe's scores so the max = 1 (0–1 range). Used for visualization only."""
-    row_max = scores.max(axis=1).replace(0, np.nan)
-    return scores.div(row_max, axis=0).fillna(0.0)
+    """Scale each cluster column by its global max across all recipes. Used for visualization only.
+    Per-column normalization preserves relative recipe strength within each cluster."""
+    col_max = scores.max(axis=0).replace(0, np.nan)
+    return scores.div(col_max, axis=1).fillna(0.0)
 
 
 def assign_clusters(scores: pd.DataFrame) -> pd.Series:
@@ -104,3 +105,55 @@ def assign_clusters(scores: pd.DataFrame) -> pd.Series:
 def map_to_panel(assigned: pd.Series, ms_to_panel: dict[str, str]) -> pd.Series:
     """Remap MS cluster names → panel GT cluster names for accuracy evaluation."""
     return assigned.map(ms_to_panel).rename("MS_panel_cluster")
+
+
+def load_rohstoffe_weights(scoring_xlsx: Path) -> pd.DataFrame:
+    """Load Mittelwert columns from Rohstoffe_im_Cluster_Scoring as a data-driven weight matrix.
+    Mittelwert = mean normalized ingredient amount across the cluster's reference recipes."""
+    raw = pd.read_excel(scoring_xlsx, sheet_name="Rohstoffe_im_Cluster_Scoring", header=None)
+    data = raw.iloc[2:].copy().reset_index(drop=True)
+    data = data[data[0].notna() & (data[0] != 0)].copy()
+    data[0] = data[0].astype(str).str.strip()
+    # Mittelwert column indices (per cluster): Unpleasant=3, warm=6, green=9, floral=12,
+    #                                          citrus=15, exotic=18, Outlayer=21
+    mittelwert_cols = [3, 6, 9, 12, 15, 18, 21]
+    result = data[[0] + mittelwert_cols].copy()
+    result.columns = ["CAS"] + CLUSTER_COLS
+    for col in CLUSTER_COLS:
+        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0.0)
+    result = result.drop_duplicates(subset="CAS")
+    return result.set_index("CAS")[CLUSTER_COLS]
+
+
+def load_avg_meli(scoring_xlsx: Path) -> pd.Series:
+    """Load AvgMeli (col 3) from Rezepte sheet: average normalized amount per CAS when present."""
+    raw = pd.read_excel(scoring_xlsx, sheet_name="Rezepte", header=None)
+    data = raw.iloc[2:].copy()
+    data = data[data[0].notna() & (data[0].astype(str) != "nan")].copy()
+    data[0] = data[0].astype(str).str.strip()
+    avg = pd.to_numeric(data[3], errors="coerce")
+    s = pd.Series(avg.values, index=data[0].values, name="avg_meli").dropna()
+    return s[~s.index.duplicated(keep="first")]
+
+
+def apply_zscore_quantities(recipes_df: pd.DataFrame, avg_meli: pd.Series) -> pd.DataFrame:
+    """Replace Totalmenge with Z-Score = Totalmenge / AvgMeli per CAS.
+    CAS not in avg_meli keep their raw Totalmenge (no scaling)."""
+    df = recipes_df.copy()
+    avg_mapped = df[_CAS_COL].map(avg_meli)
+    has_avg = avg_mapped.notna() & (avg_mapped > 0)
+    df.loc[has_avg, _TOTAL_COL] = df.loc[has_avg, _TOTAL_COL] / avg_mapped[has_avg]
+    return df
+
+
+def load_melanie_scores(scoring_xlsx: Path) -> pd.DataFrame:
+    """Load Melanie's pre-computed cluster scores from Rezepte_Scoring (rows 2-10).
+    Returns DataFrame indexed by recipe id, columns = CLUSTER_COLS + Predicted."""
+    raw = pd.read_excel(scoring_xlsx, sheet_name="Rezepte_Scoring", header=None)
+    data = raw.iloc[2:11].copy()
+    data.columns = ["Recipe"] + CLUSTER_COLS + ["Predicted"]
+    data = data[data["Recipe"].notna()].copy()
+    data["Recipe"] = data["Recipe"].astype(str).str.strip()
+    for col in CLUSTER_COLS:
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0.0)
+    return data.set_index("Recipe")

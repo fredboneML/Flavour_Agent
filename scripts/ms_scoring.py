@@ -157,3 +157,81 @@ def load_melanie_scores(scoring_xlsx: Path) -> pd.DataFrame:
     for col in CLUSTER_COLS:
         data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0.0)
     return data.set_index("Recipe")
+
+
+# ── Extended scoring variants ─────────────────────────────────────────────────
+
+def rescale_warm_weights(weights: pd.DataFrame, factor: float = 0.5) -> pd.DataFrame:
+    """Halve warm column weights to match the 0-10 scale of other clusters (warm uses 0-20)."""
+    w = weights.copy()
+    w["warm"] = w["warm"] * factor
+    return w
+
+
+def apply_squared_zscore_quantities(recipes_df: pd.DataFrame, avg_meli: pd.Series) -> pd.DataFrame:
+    """Replace Totalmenge with (Totalmenge / AvgMeli)² — amplifies signature ingredients
+    quadratically; an ingredient at 3× typical concentration contributes 9× not 3×."""
+    df = recipes_df.copy()
+    avg_mapped = df[_CAS_COL].map(avg_meli)
+    has_avg = avg_mapped.notna() & (avg_mapped > 0)
+    df.loc[has_avg, _TOTAL_COL] = (df.loc[has_avg, _TOTAL_COL] / avg_mapped[has_avg]) ** 2
+    return df
+
+
+def compute_tfidf_scores(recipes_df: pd.DataFrame, weights: pd.DataFrame) -> pd.DataFrame:
+    """TF-IDF style scoring: down-weight CAS that appear in many recipes (low cluster signal).
+    IDF[CAS] = log(N_recipes / N_recipes_containing_CAS).
+    Score = Σ weight[CAS][cluster] × Totalmenge[CAS] × IDF[CAS]."""
+    n_recipes = recipes_df[_REZ_COL].nunique()
+    present = recipes_df[recipes_df[_TOTAL_COL] > 0]
+    cas_doc_count = present.groupby(_CAS_COL)[_REZ_COL].nunique()
+    idf = np.log((n_recipes / cas_doc_count.clip(lower=1)) + 1)
+
+    df = recipes_df.copy()
+    df[_TOTAL_COL] = df[_TOTAL_COL] * df[_CAS_COL].map(idf).fillna(0.0)
+    return compute_scores(df, weights)
+
+
+def compute_topk_scores(recipes_df: pd.DataFrame, weights: pd.DataFrame, k: int = 5) -> pd.DataFrame:
+    """Score using only the top-k ingredients per recipe by total weight contribution.
+    Filters out trace amounts that add noise."""
+    merged = recipes_df.join(weights, on=_CAS_COL, how="left")
+    for col in CLUSTER_COLS:
+        merged[col] = merged[col].fillna(0.0) * merged[_TOTAL_COL]
+    merged["_total_contrib"] = merged[CLUSTER_COLS].sum(axis=1)
+
+    def _topk(grp: pd.DataFrame) -> pd.Series:
+        return grp.nlargest(k, "_total_contrib")[CLUSTER_COLS].sum()
+
+    return merged.groupby(_REZ_COL).apply(_topk)
+
+
+def compute_cosine_scores(recipes_df: pd.DataFrame, weights: pd.DataFrame) -> pd.DataFrame:
+    """Cosine similarity between each recipe's ingredient vector and each cluster's weight vector.
+    Removes bias from recipe size (number of matched CAS)."""
+    pivot = recipes_df.pivot_table(
+        index=_REZ_COL, columns=_CAS_COL, values=_TOTAL_COL, aggfunc="sum", fill_value=0.0
+    )
+    common = pivot.columns.intersection(weights.index)
+    w_clean = weights[~weights.index.duplicated(keep="first")]
+    common = pivot.columns.intersection(w_clean.index)
+    R = pivot[common].values.astype(float)
+    W = w_clean.loc[common].values.astype(float)
+
+    R_norm = R / (np.linalg.norm(R, axis=1, keepdims=True) + 1e-12)
+    W_norm = W / (np.linalg.norm(W, axis=0, keepdims=True) + 1e-12)
+
+    sim = R_norm @ W_norm
+    return pd.DataFrame(sim, index=pivot.index, columns=CLUSTER_COLS)
+
+
+def ensemble_scores(*score_dfs: pd.DataFrame) -> pd.DataFrame:
+    """Average multiple score matrices after normalizing each to sum=1 per recipe."""
+    normed = []
+    for df in score_dfs:
+        row_sum = df.sum(axis=1).replace(0, np.nan)
+        normed.append(df.div(row_sum, axis=0).fillna(0.0))
+    combined = normed[0]
+    for n in normed[1:]:
+        combined = combined.add(n, fill_value=0.0)
+    return combined / len(normed)

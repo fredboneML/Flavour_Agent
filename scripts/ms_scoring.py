@@ -6,10 +6,25 @@ and assigns each recipe to argmax cluster.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Words stripped from ingredient names when building CAS alias lookups.
+_NAME_QUALIFIERS = re.compile(
+    r"\b(natürlich|natural|halal|kosher|bg|kbg|nf|food\s+grade|ex\s+eugenol|"
+    r"ex\s+lignin|ex\s+wood|ex|mild|80%|90%|95%|99%)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _normalize_name(name: str) -> str:
+    """Strip certification/quality qualifiers to get base chemical name."""
+    s = _NAME_QUALIFIERS.sub("", name.lower())
+    s = re.sub(r"[,;()\-]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 CLUSTER_COLS = ["Unpleasant", "warm", "green", "floral", "citrus", "exotic", "Outlayer"]
 _REZ_COL = "Rez.-Nr."
@@ -125,24 +140,67 @@ def load_rohstoffe_weights(scoring_xlsx: Path) -> pd.DataFrame:
     return result.set_index("CAS")[CLUSTER_COLS]
 
 
-def load_avg_meli(scoring_xlsx: Path) -> pd.Series:
-    """Load AvgMeli (col 3) from Rezepte sheet: average normalized amount per CAS when present."""
+def load_avg_meli(scoring_xlsx: Path, csv_path: Path | None = None) -> pd.Series:
+    """Load AvgMeli (col 3) from Rezepte sheet: average normalized amount per CAS when present.
+
+    If csv_path is provided, extend the result with name-based aliases so that CAS variants
+    that appear in the recipe CSV under different CAS numbers (e.g. "Cycloten natürlich Halal"
+    80-71-7 vs "Cycloten Halal Kosher" 765-70-8) still receive a valid AvgMeli.
+    """
     raw = pd.read_excel(scoring_xlsx, sheet_name="Rezepte", header=None)
     data = raw.iloc[2:].copy()
     data = data[data[0].notna() & (data[0].astype(str) != "nan")].copy()
     data[0] = data[0].astype(str).str.strip()
+    data[1] = data[1].astype(str).str.strip()
     avg = pd.to_numeric(data[3], errors="coerce")
     s = pd.Series(avg.values, index=data[0].values, name="avg_meli").dropna()
-    return s[~s.index.duplicated(keep="first")]
+    s = s[~s.index.duplicated(keep="first")]
+
+    if csv_path is None:
+        return s
+
+    # Build normalized-name → AvgMeli from Rezepte reference data
+    name_map: dict[str, float] = {}
+    for cas, am in s.items():
+        rows = data[data[0] == cas]
+        if rows.empty:
+            continue
+        norm = _normalize_name(str(rows.iloc[0, 1]))
+        if norm and norm not in name_map:
+            name_map[norm] = float(am)
+
+    # For each CAS in CSV with no (or zero) AvgMeli, attempt a name-based alias.
+    # A CAS may already be in s.index with value 0 (ingredient not in Melanie's reference
+    # recipes) but its Halal/Kosher variant may have a valid AvgMeli — allow alias in that case.
+    csv_df = pd.read_csv(csv_path, dtype=str)[[_CAS_COL, _NAME_COL]].drop_duplicates()
+    csv_df[_CAS_COL] = csv_df[_CAS_COL].astype(str).str.strip()
+    extras: dict[str, float] = {}
+    for _, row in csv_df.iterrows():
+        cas = row[_CAS_COL]
+        if not cas or cas.lower() in ("nan", "none", ""):
+            continue  # skip rows with no valid CAS
+        if cas in s.index and float(s[cas]) > 0:
+            continue  # already has a valid AvgMeli
+        norm = _normalize_name(str(row[_NAME_COL]))
+        if norm in name_map:
+            extras[cas] = name_map[norm]
+
+    if extras:
+        extras_series = pd.Series(extras, name="avg_meli")
+        # Drop zero-AvgMeli entries from s that are being replaced by aliases
+        s_clean = s.drop(index=[c for c in extras if c in s.index])
+        return pd.concat([s_clean, extras_series])
+    return s
 
 
 def apply_zscore_quantities(recipes_df: pd.DataFrame, avg_meli: pd.Series) -> pd.DataFrame:
     """Replace Totalmenge with Z-Score = Totalmenge / AvgMeli per CAS.
-    CAS not in avg_meli keep their raw Totalmenge (no scaling)."""
+    CAS with no AvgMeli or AvgMeli=0 are zeroed out (matches Melanie's formula exactly)."""
     df = recipes_df.copy()
     avg_mapped = df[_CAS_COL].map(avg_meli)
     has_avg = avg_mapped.notna() & (avg_mapped > 0)
-    df.loc[has_avg, _TOTAL_COL] = df.loc[has_avg, _TOTAL_COL] / avg_mapped[has_avg]
+    df.loc[has_avg,  _TOTAL_COL] = df.loc[has_avg, _TOTAL_COL] / avg_mapped[has_avg]
+    df.loc[~has_avg, _TOTAL_COL] = 0.0
     return df
 
 

@@ -293,3 +293,84 @@ def ensemble_scores(*score_dfs: pd.DataFrame) -> pd.DataFrame:
     for n in normed[1:]:
         combined = combined.add(n, fill_value=0.0)
     return combined / len(normed)
+
+
+# ── Fourth Trial Set loaders ──────────────────────────────────────────────────
+
+_FOURTH_TRIAL_EXTRA_COLS = ["nussig", "fresh", "woody", "FMP", "Extrakte"]
+
+
+def load_fourth_trial_weight_matrix(excel_path: Path) -> pd.DataFrame:
+    """Load weight matrix from the Fourth Trial Set 'Scoring Index' sheet.
+
+    Uses only the 7 original CLUSTER_COLS; nussig/fresh/woody/FMP/Extrakte are ignored.
+    Sheet layout matches the existing Übersicht Score Index pattern: skiprows=2, no header row,
+    columns manually assigned.
+    """
+    raw = pd.read_excel(
+        excel_path,
+        sheet_name="Scoring Index",
+        header=None,
+        skiprows=2,
+    )
+    raw.columns = ["CAS", "Name"] + CLUSTER_COLS + _FOURTH_TRIAL_EXTRA_COLS
+    raw = raw[raw["CAS"].notna() & (raw["CAS"] != 0)].copy()
+    raw["CAS"] = raw["CAS"].astype(str).str.strip()
+    for col in CLUSTER_COLS:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0.0)
+    return raw.set_index("CAS")[CLUSTER_COLS]
+
+
+def load_fourth_trial_recipes(excel_path: Path) -> pd.DataFrame:
+    """Load and preprocess recipes from the Fourth Trial Set Excel.
+
+    Steps:
+    1. Read 'Rezepte Gesamt AJ' (header at row 13 after metadata rows).
+    2. Join with 'CAS Nr.' sheet on Ident.1 -> Ident. to resolve CAS numbers.
+    3. Read 'Normalisierung' sheet; zero out any ingredient whose CAS is listed there.
+    4. Normalize Totalmenge per recipe (sum -> 1).
+    Returns long-format DataFrame: [Rez.-Nr., CAS-Nr., Totalmenge (normalized)].
+    """
+    # --- Recipe rows ---
+    rez = pd.read_excel(excel_path, sheet_name="Rezepte Gesamt AJ", skiprows=13, dtype=str)
+    rez = rez[rez["Rez.-Nr."].notna() & (rez["Rez.-Nr."] != "Rez.-Nr.")].copy()
+    rez["Totalmenge"] = pd.to_numeric(rez["Totalmenge"], errors="coerce").fillna(0.0)
+    rez["Ident.1"] = rez["Ident.1"].astype(str).str.strip()
+
+    # --- CAS lookup: Ident. -> CAS-Nr. ---
+    cas_raw = pd.read_excel(excel_path, sheet_name="CAS Nr.", skiprows=13, dtype=str)
+    cas_col = next(c for c in cas_raw.columns if str(c).startswith("CAS-Nr."))
+    cas_raw["Ident."] = cas_raw["Ident."].astype(str).str.strip()
+    cas_raw[cas_col] = cas_raw[cas_col].astype(str).str.strip()
+    cas_lookup = (
+        cas_raw.dropna(subset=[cas_col])
+        .set_index("Ident.")[cas_col]
+    )
+    cas_lookup = cas_lookup[~cas_lookup.isin(["nan", "None", ""])]
+
+    rez["CAS-Nr."] = rez["Ident.1"].map(cas_lookup)
+    unmatched = rez["CAS-Nr."].isna().sum()
+    if unmatched:
+        print(f"INFO: {unmatched} ingredient rows have no CAS-Nr. match and are dropped")
+    rez = rez[rez["CAS-Nr."].notna()].copy()
+    rez["CAS-Nr."] = rez["CAS-Nr."].astype(str).str.strip()
+
+    # --- Normalisierung: build ignore set from CAS-Nr. column ---
+    norm_raw = pd.read_excel(excel_path, sheet_name="Normalisierung", skiprows=2, dtype=str)
+    norm_cas_col = next((c for c in norm_raw.columns if str(c).startswith("CAS-Nr.")), None)
+    ignore_cas: set[str] = set()
+    if norm_cas_col:
+        ignore_cas = set(
+            norm_raw[norm_cas_col].dropna().astype(str).str.strip()
+        ) - {"nan", "None", ""}
+    rez.loc[rez["CAS-Nr."].isin(ignore_cas), "Totalmenge"] = 0.0
+
+    # --- Per-recipe normalization ---
+    per_recipe_total = rez.groupby("Rez.-Nr.")["Totalmenge"].transform("sum")
+    rez["Totalmenge"] = np.where(
+        per_recipe_total > 0,
+        rez["Totalmenge"] / per_recipe_total,
+        rez["Totalmenge"],
+    )
+
+    return rez[["Rez.-Nr.", "CAS-Nr.", "Totalmenge"]].copy()

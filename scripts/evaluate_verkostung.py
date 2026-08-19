@@ -224,6 +224,7 @@ def per_cluster_accuracy(
     if reachable_only:
         evalset = evalset[evalset[set_col].map(lambda s: bool(set(s) & REACHABLE))].copy()
     evalset["_group"] = evalset[set_col].map(lambda s: ", ".join(s))
+    totals = {m: 0 for m in preds_by_method}
     rows = []
     for group, g in evalset.groupby("_group"):
         row = {"True_cluster": group, "n": len(g)}
@@ -233,10 +234,15 @@ def per_cluster_accuracy(
                 pred = panel_pred.get(r["pdm_id"])
                 pred = None if (pred is None or isinstance(pred, float)) else str(pred).lower()
                 corr += pred in set(r[set_col])
+            totals[method] += corr
             row[method] = round(100 * corr / len(g), 0)
         rows.append(row)
     df = pd.DataFrame(rows).sort_values("n", ascending=False, ignore_index=True)
-    return df
+    # Weighted overall row: total recipes and each method's accuracy over all of them.
+    n_total = len(evalset)
+    total_row = {"True_cluster": "TOTAL", "n": n_total,
+                 **{m: round(100 * totals[m] / n_total, 0) if n_total else None for m in preds_by_method}}
+    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
 
 def main() -> None:

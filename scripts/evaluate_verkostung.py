@@ -211,6 +211,26 @@ def accuracy(preds_by_method: dict, truth: pd.DataFrame, set_col: str) -> pd.Dat
     return pd.DataFrame(out).sort_values("Accuracy_%", ascending=False, ignore_index=True)
 
 
+def per_cluster_accuracy(preds_by_method: dict, truth: pd.DataFrame, set_col: str) -> pd.DataFrame:
+    """Accuracy per TRUE cluster × method: read down a method column to see which clusters it
+    nails vs misses. Rows = true label (joined ``set_col``), columns = n + one % per method."""
+    evalset = truth[truth[set_col].map(len) > 0].copy()
+    evalset["_group"] = evalset[set_col].map(lambda s: ", ".join(s))
+    rows = []
+    for group, g in evalset.groupby("_group"):
+        row = {"True_cluster": group, "n": len(g)}
+        for method, panel_pred in preds_by_method.items():
+            corr = 0
+            for _, r in g.iterrows():
+                pred = panel_pred.get(r["pdm_id"])
+                pred = None if (pred is None or isinstance(pred, float)) else str(pred).lower()
+                corr += pred in set(r[set_col])
+            row[method] = round(100 * corr / len(g), 0)
+        rows.append(row)
+    df = pd.DataFrame(rows).sort_values("n", ascending=False, ignore_index=True)
+    return df
+
+
 def main() -> None:
     variants = build_variants()
     n_recipes = len(next(iter(variants.values())))
@@ -261,6 +281,12 @@ def main() -> None:
             rec[f"{m} [panel]"] = panel_pred[m].get(pid)
         subset_rows.append(rec)
     subset_df = pd.DataFrame(subset_rows)
+    # Group recipes by their true label so per-cluster performance is scannable at a glance.
+    subset_df = subset_df.sort_values(["M1_set", "M2_set", "Recipe"], ignore_index=True)
+
+    # Per-true-cluster accuracy (rows = true cluster, columns = method) for M1 and M2.
+    pc_m1 = per_cluster_accuracy(panel_pred, eval_truth, "M1_set")
+    pc_m2 = per_cluster_accuracy(panel_pred, eval_truth, "M2_set")
 
     # All-recipe hand-over: raw MS argmax cluster per method (full info, no mapping loss).
     all_pred = pd.DataFrame({m: ms_cluster[m] for m in variants})
@@ -294,6 +320,8 @@ def main() -> None:
         acc_m1.to_excel(writer, sheet_name="Accuracy_vs_M1", index=False)
         acc_m2.to_excel(writer, sheet_name="Accuracy_vs_M2", index=False)
         subset_df.to_excel(writer, sheet_name="Subset_Predictions", index=False)
+        pc_m1.to_excel(writer, sheet_name="Per_Cluster_vs_M1", index=False)
+        pc_m2.to_excel(writer, sheet_name="Per_Cluster_vs_M2", index=False)
         truth_out.to_excel(writer, sheet_name="Truth_Labels", index=False)
         if len(excluded_df):
             excluded_df.to_excel(writer, sheet_name="Excluded_Recipes", index=False)

@@ -211,10 +211,18 @@ def accuracy(preds_by_method: dict, truth: pd.DataFrame, set_col: str) -> pd.Dat
     return pd.DataFrame(out).sort_values("Accuracy_%", ascending=False, ignore_index=True)
 
 
-def per_cluster_accuracy(preds_by_method: dict, truth: pd.DataFrame, set_col: str) -> pd.DataFrame:
+def per_cluster_accuracy(
+    preds_by_method: dict, truth: pd.DataFrame, set_col: str, reachable_only: bool = False
+) -> pd.DataFrame:
     """Accuracy per TRUE cluster × method: read down a method column to see which clusters it
-    nails vs misses. Rows = true label (joined ``set_col``), columns = n + one % per method."""
+    nails vs misses. Rows = true label (joined ``set_col``), columns = n + one % per method.
+
+    reachable_only: drop recipes whose true cluster has no weight column (i.e. dairy /
+    Walderdbeere — clusters the methods can never predict), so scores reflect only reachable cases.
+    """
     evalset = truth[truth[set_col].map(len) > 0].copy()
+    if reachable_only:
+        evalset = evalset[evalset[set_col].map(lambda s: bool(set(s) & REACHABLE))].copy()
     evalset["_group"] = evalset[set_col].map(lambda s: ", ".join(s))
     rows = []
     for group, g in evalset.groupby("_group"):
@@ -287,6 +295,8 @@ def main() -> None:
     # Per-true-cluster accuracy (rows = true cluster, columns = method) for M1 and M2.
     pc_m1 = per_cluster_accuracy(panel_pred, eval_truth, "M1_set")
     pc_m2 = per_cluster_accuracy(panel_pred, eval_truth, "M2_set")
+    pc_m1_reach = per_cluster_accuracy(panel_pred, eval_truth, "M1_set", reachable_only=True)
+    pc_m2_reach = per_cluster_accuracy(panel_pred, eval_truth, "M2_set", reachable_only=True)
 
     # All-recipe hand-over: raw MS argmax cluster per method (full info, no mapping loss).
     all_pred = pd.DataFrame({m: ms_cluster[m] for m in variants})
@@ -322,6 +332,8 @@ def main() -> None:
         subset_df.to_excel(writer, sheet_name="Subset_Predictions", index=False)
         pc_m1.to_excel(writer, sheet_name="Per_Cluster_vs_M1", index=False)
         pc_m2.to_excel(writer, sheet_name="Per_Cluster_vs_M2", index=False)
+        pc_m1_reach.to_excel(writer, sheet_name="Per_Cluster_vs_M1_reachable", index=False)
+        pc_m2_reach.to_excel(writer, sheet_name="Per_Cluster_vs_M2_reachable", index=False)
         truth_out.to_excel(writer, sheet_name="Truth_Labels", index=False)
         if len(excluded_df):
             excluded_df.to_excel(writer, sheet_name="Excluded_Recipes", index=False)

@@ -261,6 +261,25 @@ def main() -> None:
     truth_out["M1_set"] = truth_out["M1_set"].map(lambda s: ", ".join(s))
     truth_out["M2_set"] = truth_out["M2_set"].map(lambda s: ", ".join(s))
 
+    # Readable column labels for the exported sheets (internal keys stay terse).
+    READABLE = {
+        "H": "Prozent %",
+        "B_M1": "M1 Label Propagation",
+        "C_M2": "M2 Rule Based",
+        "D": "Cluster vorgegeben",
+        "E": "Jan Free Sorting",
+        "M1_set": "M1 true labels",
+        "M2_set": "M2 true labels",
+        "in_pdm": "In PDM export",
+        "pdm_id": "PDM Rez.-Nr.",
+        "evaluable": "Evaluable",
+        "truth_method": "Truth method",
+        "truth": "True label(s)",
+    }
+    truth_out = truth_out.rename(columns=READABLE)
+    subset_df = subset_df.rename(columns=READABLE)
+    excluded_df = excluded_df.rename(columns=READABLE)
+
     OUT_XLSX.parent.mkdir(exist_ok=True)
     with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
         acc_m1.to_excel(writer, sheet_name="Accuracy_vs_M1", index=False)

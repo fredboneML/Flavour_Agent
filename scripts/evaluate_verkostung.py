@@ -304,6 +304,22 @@ def main() -> None:
     pc_m1_reach = per_cluster_accuracy(panel_pred, eval_truth, "M1_set", reachable_only=True)
     pc_m2_reach = per_cluster_accuracy(panel_pred, eval_truth, "M2_set", reachable_only=True)
 
+    # Z-method predictions for the reachable recipes (true cluster is one a method can output).
+    z_methods = [m for m in variants if m in Z_METHODS]
+    reach = eval_truth[eval_truth["M1_set"].map(lambda s: bool(set(s) & REACHABLE))].copy()
+    reach["_k1"] = reach["M1_set"].map(lambda s: ", ".join(s))
+    reach["_k2"] = reach["M2_set"].map(lambda s: ", ".join(s))
+    reach = reach.sort_values(["_k1", "_k2", "Recipe"])
+    zrows = []
+    for _, r in reach.iterrows():
+        pid = r["pdm_id"]
+        row = {"Recipe": r["Recipe"], "M1 true": ", ".join(r["M1_set"]), "M2 true": ", ".join(r["M2_set"])}
+        for m in z_methods:
+            pred = panel_pred[m].get(pid)
+            row[m] = None if (pred is None or isinstance(pred, float)) else str(pred)
+        zrows.append(row)
+    zmethods_reach = pd.DataFrame(zrows)
+
     # All-recipe hand-over: raw MS argmax cluster per method (full info, no mapping loss).
     all_pred = pd.DataFrame({m: ms_cluster[m] for m in variants})
     all_pred.index.name = "Rez.-Nr."
@@ -340,6 +356,7 @@ def main() -> None:
         pc_m2.to_excel(writer, sheet_name="Per_Cluster_vs_M2", index=False)
         pc_m1_reach.to_excel(writer, sheet_name="Per_Cluster_vs_M1_reachable", index=False)
         pc_m2_reach.to_excel(writer, sheet_name="Per_Cluster_vs_M2_reachable", index=False)
+        zmethods_reach.to_excel(writer, sheet_name="ZMethods_Reachable_17", index=False)
         truth_out.to_excel(writer, sheet_name="Truth_Labels", index=False)
         if len(excluded_df):
             excluded_df.to_excel(writer, sheet_name="Excluded_Recipes", index=False)

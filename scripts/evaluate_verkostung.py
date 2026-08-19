@@ -32,6 +32,7 @@ from scripts.ms_scoring import (
     assign_clusters,
     map_to_panel,
     apply_zscore_quantities,
+    central_amount_when_present,
     apply_squared_zscore_quantities,
     rescale_warm_weights,
     compute_tfidf_scores,
@@ -65,8 +66,8 @@ SEVEN = {"warm", "floral", "walderdbeere", "green", "dairy", "unpleasant", "frui
 REACHABLE = {"warm", "unpleasant", "green", "floral", "fruity"}
 
 Z_METHODS = {
-    "MS Z-Score", "Warm + Z-Score", "Squared Z-Score",
-    "Warm + Sq.Z-Score", "Ensemble orig+Z", "Ensemble warm+Z",
+    "MS Z-Score", "Z-Score mean", "Z-Score median", "Warm + Z-Score",
+    "Squared Z-Score", "Warm + Sq.Z-Score", "Ensemble orig+Z", "Ensemble warm+Z",
 }
 
 
@@ -100,6 +101,12 @@ def build_variants():
 
     scores = compute_scores(recipes_df, weights)
     scores_z = compute_scores(apply_zscore_quantities(recipes_df, avg_meli), weights)
+    # Data-derived Z-Scores: divide amounts by the mean / median amount-when-present per CAS,
+    # computed from the recipe dataset itself (median is robust to outlier recipes).
+    mean_present = central_amount_when_present(recipes_df, "mean")
+    median_present = central_amount_when_present(recipes_df, "median")
+    scores_z_mean = compute_scores(apply_zscore_quantities(recipes_df, mean_present), weights)
+    scores_z_median = compute_scores(apply_zscore_quantities(recipes_df, median_present), weights)
     scores_rohst = compute_scores(recipes_df, weights_rohst)
     sc_warm = compute_scores(recipes_df, weights_warm)
     sc_warm_z = compute_scores(apply_zscore_quantities(recipes_df, avg_meli), weights_warm)
@@ -118,6 +125,8 @@ def build_variants():
     return {
         "MS original": scores,
         "MS Z-Score": scores_z,
+        "Z-Score mean": scores_z_mean,
+        "Z-Score median": scores_z_median,
         "MS Rohstoffe": scores_rohst,
         "Warm rescale": sc_warm,
         "Warm + Z-Score": sc_warm_z,

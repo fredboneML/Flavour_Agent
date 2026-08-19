@@ -204,6 +204,26 @@ def apply_zscore_quantities(recipes_df: pd.DataFrame, avg_meli: pd.Series) -> pd
     return df
 
 
+def central_amount_when_present(recipes_df: pd.DataFrame, stat: str = "mean") -> pd.Series:
+    """Per-CAS central normalized amount across recipes where the ingredient is present.
+
+    Data-derived denominator for Z-Score variants: for each CAS, take the normalized
+    Totalmenge over rows where it is present (>0) and reduce with ``stat``. Feed the result
+    into ``apply_zscore_quantities`` to build a Z-Score = amount / central-amount.
+    - ``"mean"``   → sensitive to outlier recipes (a few with unusually high dosage).
+    - ``"median"`` → robust to such outliers.
+    """
+    present = recipes_df[recipes_df[_TOTAL_COL] > 0]
+    grp = present.groupby(_CAS_COL)[_TOTAL_COL]
+    if stat == "mean":
+        s = grp.mean()
+    elif stat == "median":
+        s = grp.median()
+    else:
+        raise ValueError(f"stat must be 'mean' or 'median', got {stat!r}")
+    return s[s > 0].rename("central_meli")
+
+
 def load_melanie_scores(scoring_xlsx: Path) -> pd.DataFrame:
     """Load Melanie's pre-computed cluster scores from Rezepte_Scoring (rows 2-10).
     Returns DataFrame indexed by recipe id, columns = CLUSTER_COLS + Predicted."""

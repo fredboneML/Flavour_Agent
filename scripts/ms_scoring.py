@@ -224,6 +224,18 @@ def central_amount_when_present(recipes_df: pd.DataFrame, stat: str = "mean") ->
     return s[s > 0].rename("central_meli")
 
 
+def apply_threshold(recipes_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """Hard cutoff on a Z-Score frame: zero out ingredient contributions below ``threshold``.
+
+    Intended to run after ``apply_zscore_quantities`` (where Totalmenge holds the z-score
+    amount / typical-amount). Keeps only ingredients dosed at >= ``threshold`` × their typical
+    amount, denoising trace/incidental ingredients before cluster scoring.
+    """
+    df = recipes_df.copy()
+    df.loc[df[_TOTAL_COL] < threshold, _TOTAL_COL] = 0.0
+    return df
+
+
 def load_melanie_scores(scoring_xlsx: Path) -> pd.DataFrame:
     """Load Melanie's pre-computed cluster scores from Rezepte_Scoring (rows 2-10).
     Returns DataFrame indexed by recipe id, columns = CLUSTER_COLS + Predicted."""

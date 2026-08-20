@@ -336,8 +336,18 @@ def main() -> None:
         zrows.append(row)
     zmethods_reach = pd.DataFrame(zrows)
 
-    # All-recipe hand-over: raw MS argmax cluster per method (full info, no mapping loss).
-    all_pred = pd.DataFrame({m: ms_cluster[m] for m in variants})
+    # Order methods best-first (by M1 reachable accuracy, then raw) for the hand-over sheets.
+    method_order = acc_m1.sort_values(
+        ["Accuracy_reachable_%", "Accuracy_%"], ascending=False)["Method"].tolist()
+
+    def order_cols(df):
+        return df[["True_cluster", "n"] + [m for m in method_order if m in df.columns]]
+
+    pc_m1, pc_m2 = order_cols(pc_m1), order_cols(pc_m2)
+    pc_m1_reach, pc_m2_reach = order_cols(pc_m1_reach), order_cols(pc_m2_reach)
+
+    # All-recipe hand-over: raw MS argmax cluster per method (best-performing methods first).
+    all_pred = pd.DataFrame({m: ms_cluster[m] for m in variants})[method_order]
     all_pred.index.name = "Rez.-Nr."
 
     truth_out = truth.drop(columns=["base"]).copy()

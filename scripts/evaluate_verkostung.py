@@ -282,6 +282,9 @@ def main() -> None:
     eval_truth = truth[truth["evaluable"]].copy()
     acc_m1 = accuracy(panel_pred, eval_truth, "M1_set")
     acc_m2 = accuracy(panel_pred, eval_truth, "M2_set")
+    # Method order, best-first (by M1 reachable accuracy, then raw) — reused across hand-over sheets.
+    method_order = acc_m1.sort_values(
+        ["Accuracy_reachable_%", "Accuracy_%"], ascending=False)["Method"].tolist()
 
     # Recipes whose truth set has no reachable cluster (only dairy/Walderdbeere) — the
     # z-methods can never predict these, so they are excluded from the reachable-only view.
@@ -320,8 +323,7 @@ def main() -> None:
     pc_m1_reach = per_cluster_accuracy(panel_pred, eval_truth, "M1_set", reachable_only=True)
     pc_m2_reach = per_cluster_accuracy(panel_pred, eval_truth, "M2_set", reachable_only=True)
 
-    # Z-method predictions for the reachable recipes (true cluster is one a method can output).
-    z_methods = [m for m in variants if m in Z_METHODS]
+    # Per-recipe predictions of ALL methods on the reachable recipes, methods best-first.
     reach = eval_truth[eval_truth["M1_set"].map(lambda s: bool(set(s) & REACHABLE))].copy()
     reach["_k1"] = reach["M1_set"].map(lambda s: ", ".join(s))
     reach["_k2"] = reach["M2_set"].map(lambda s: ", ".join(s))
@@ -330,15 +332,11 @@ def main() -> None:
     for _, r in reach.iterrows():
         pid = r["pdm_id"]
         row = {"Recipe": r["Recipe"], "M1 true": ", ".join(r["M1_set"]), "M2 true": ", ".join(r["M2_set"])}
-        for m in z_methods:
+        for m in method_order:
             pred = panel_pred[m].get(pid)
             row[m] = None if (pred is None or isinstance(pred, float)) else str(pred)
         zrows.append(row)
     zmethods_reach = pd.DataFrame(zrows)
-
-    # Order methods best-first (by M1 reachable accuracy, then raw) for the hand-over sheets.
-    method_order = acc_m1.sort_values(
-        ["Accuracy_reachable_%", "Accuracy_%"], ascending=False)["Method"].tolist()
 
     def order_cols(df):
         return df[["True_cluster", "n"] + [m for m in method_order if m in df.columns]]

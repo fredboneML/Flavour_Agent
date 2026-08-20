@@ -40,6 +40,7 @@ from scripts.ms_scoring import (
     compute_cosine_scores,
     ensemble_scores,
 )
+from scripts.odor_threshold import cas_odor_sets, masked_weights, threshold_variants
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLD = ROOT / "data" / "gold"
@@ -122,7 +123,7 @@ def build_variants():
     sc_ens_oz = ensemble_scores(scores, scores_z)
     sc_ens_wz = ensemble_scores(sc_warm, sc_warm_z)
 
-    return {
+    variants = {
         "MS original": scores,
         "MS Z-Score": scores_z,
         "Z-Score mean": scores_z_mean,
@@ -141,6 +142,21 @@ def build_variants():
         "Ensemble orig+Z": sc_ens_oz,
         "Ensemble warm+Z": sc_ens_wz,
     }
+
+    # ── Odor-type gate + odor-threshold (OAV) methods ────────────────────────────
+    # Odor data covers the strawberry palette; keep_unknown=True leaves non-strawberry
+    # ingredients ungated so all 3,981 recipes stay scoreable for later evaluation.
+    z_base = apply_zscore_quantities(recipes_df, avg_meli)
+    odor = cas_odor_sets()
+    w_gate = masked_weights(weights, odor, keep_unknown=True)
+
+    # Threshold combinations on plain MS Z-Score (expert weights)
+    variants.update(threshold_variants(recipes_df, weights, z_base, weights, prefix=""))
+    # Odor-type gate, alone and combined with each threshold transform
+    variants["Odor-gate"] = compute_scores(z_base, w_gate)
+    variants.update(threshold_variants(recipes_df, weights, z_base, w_gate, prefix="Odor-gate + "))
+
+    return variants
 
 
 # ── 2. Build the truth table from the Verkostung file ─────────────────────────

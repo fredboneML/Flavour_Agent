@@ -224,6 +224,34 @@ def central_amount_when_present(recipes_df: pd.DataFrame, stat: str = "mean") ->
     return s[s > 0].rename("central_meli")
 
 
+def apply_per_fruit_zscore(recipes_df: pd.DataFrame, group_of: dict, stat: str = "mean") -> pd.DataFrame:
+    """Z-Score with a per-group (e.g. per-fruit) denominator instead of a global one.
+
+    For each ingredient, divide its normalized amount by the mean/median amount-when-present
+    computed over recipes of the SAME group (``group_of`` maps Rez.-Nr. -> group). Groups too
+    sparse for a given CAS fall back to the global central-amount, so every ingredient still gets
+    a denominator. Returns the same long frame as ``apply_zscore_quantities``.
+    """
+    df = recipes_df.copy()
+    grp = df[_REZ_COL].map(group_of)
+    fallback = central_amount_when_present(df, stat).to_dict()  # per-CAS global denominator
+
+    present = df[df[_TOTAL_COL] > 0].copy()
+    present["_grp"] = present[_REZ_COL].map(group_of)
+    g = present.groupby(["_grp", _CAS_COL])[_TOTAL_COL]
+    per = (g.median() if stat == "median" else g.mean())
+    per = per[per > 0].to_dict()  # (group, CAS) -> denominator
+
+    keys = list(zip(grp, df[_CAS_COL]))
+    denom = pd.Series([per.get(k) for k in keys], index=df.index)
+    denom = denom.fillna(df[_CAS_COL].map(fallback))
+
+    has = denom.notna() & (denom > 0)
+    df.loc[has, _TOTAL_COL] = df.loc[has, _TOTAL_COL] / denom[has]
+    df.loc[~has, _TOTAL_COL] = 0.0
+    return df[[_REZ_COL, _CAS_COL, _TOTAL_COL]].copy()
+
+
 def apply_threshold(recipes_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     """Hard cutoff on a Z-Score frame: zero out ingredient contributions below ``threshold``.
 

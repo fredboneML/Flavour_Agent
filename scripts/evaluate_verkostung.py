@@ -33,6 +33,7 @@ from scripts.ms_scoring import (
     map_to_panel,
     apply_zscore_quantities,
     central_amount_when_present,
+    apply_per_fruit_zscore,
     apply_squared_zscore_quantities,
     rescale_warm_weights,
     compute_tfidf_scores,
@@ -40,13 +41,23 @@ from scripts.ms_scoring import (
     compute_cosine_scores,
     ensemble_scores,
 )
-from scripts.odor_threshold import cas_odor_sets, masked_weights, threshold_variants
+from scripts.odor_threshold import (
+    cas_odor_sets, masked_weights, threshold_variants, cas_threshold, factor_frame,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLD = ROOT / "data" / "gold"
 
 SCORING_XLSX = GOLD / "Scoring Index_Beispielrechung.xlsx"
 PDM_CSV = GOLD / "PDM_Rezepturen_Gesamt_nurP_18_08_2026.csv"
+PDM_XLSX = GOLD / "PDM_Rezepturen_Gesamt_nurP_18_08_2026.xlsx"
+
+
+def fruit_labels() -> dict:
+    """Rez.-Nr. -> fruit type = leading token of Rezepturbezeichnung (from the source XLSX)."""
+    df = pd.read_excel(PDM_XLSX, sheet_name="Rezept", header=14, dtype=str)
+    fruit = df["Rezepturbezeichnung"].astype(str).str.split(r"[\s\-]", n=1).str[0].str.strip()
+    return dict(zip(df["Rez.-Nr."].astype(str).str.strip(), fruit))
 IGNORE_PATH = GOLD / "ignone_substances.csv"
 VERK_XLSX = GOLD / "Ergebnisse Verkostung 25_06_2026.xlsx"
 OUT_XLSX = ROOT / "outputs" / "verkostung_eval_25_06_2026.xlsx"
@@ -155,6 +166,23 @@ def build_variants():
     # Odor-type gate, alone and combined with each threshold transform
     variants["Odor-gate"] = compute_scores(z_base, w_gate)
     variants.update(threshold_variants(recipes_df, weights, z_base, w_gate, prefix="Odor-gate + "))
+
+    # ── Per-fruit denominator variants of the top methods ────────────────────────
+    # z-score divides amounts by the typical amount computed within each recipe's own fruit
+    # (Rezepturbezeichnung), instead of over all fruits.
+    fruit_of = fruit_labels()
+    thr, med = cas_threshold()
+    for stat in ("mean", "median"):
+        zpf = apply_per_fruit_zscore(recipes_df, fruit_of, stat)
+        tag = f" (per-fruit {stat})"
+        variants[f"Z-Score{tag}"] = compute_scores(zpf, weights)
+        variants[f"Odor-gate{tag}"] = compute_scores(zpf, w_gate)
+        variants[f"inv-threshold a=0.25{tag}"] = compute_scores(
+            factor_frame(zpf, thr, med, "inv", 0.25), weights)
+        variants[f"Odor-gate + inv-threshold a=0.25{tag}"] = compute_scores(
+            factor_frame(zpf, thr, med, "inv", 0.25), w_gate)
+        variants[f"Odor-gate + inv-threshold a=0.5{tag}"] = compute_scores(
+            factor_frame(zpf, thr, med, "inv", 0.5), w_gate)
 
     return variants
 
@@ -282,9 +310,12 @@ def main() -> None:
     eval_truth = truth[truth["evaluable"]].copy()
     acc_m1 = accuracy(panel_pred, eval_truth, "M1_set")
     acc_m2 = accuracy(panel_pred, eval_truth, "M2_set")
-    # Method order, best-first (by M1 reachable accuracy, then raw) — reused across hand-over sheets.
-    method_order = acc_m1.sort_values(
-        ["Accuracy_reachable_%", "Accuracy_%"], ascending=False)["Method"].tolist()
+    # Method order, best-first (M1 reachable, then M2 reachable, then M1 raw) — reused across sheets.
+    _rank = acc_m1[["Method", "Accuracy_reachable_%", "Accuracy_%"]].merge(
+        acc_m2[["Method", "Accuracy_reachable_%"]].rename(
+            columns={"Accuracy_reachable_%": "_m2r"}), on="Method")
+    method_order = _rank.sort_values(
+        ["Accuracy_reachable_%", "_m2r", "Accuracy_%"], ascending=False)["Method"].tolist()
 
     # Recipes whose truth set has no reachable cluster (only dairy/Walderdbeere) — the
     # z-methods can never predict these, so they are excluded from the reachable-only view.

@@ -58,6 +58,91 @@ def fruit_labels() -> dict:
     df = pd.read_excel(PDM_XLSX, sheet_name="Rezept", header=14, dtype=str)
     fruit = df["Rezepturbezeichnung"].astype(str).str.split(r"[\s\-]", n=1).str[0].str.strip()
     return dict(zip(df["Rez.-Nr."].astype(str).str.strip(), fruit))
+
+
+# ── Human-readable explanation of the key methods (hand-over reference sheet) ──────────
+# Common notation: amount = per-recipe-normalised ingredient amount (a recipe's amounts sum to 1);
+# z = amount / D where D is the "typical amount" denominator; score[c] = Σ over ingredients of
+# z × weight[CAS][c]; the recipe is assigned to argmax over clusters c. weight = Melanie's expert
+# 0–20 matrix. Denominators D: AvgMeli = mean amount when present over Melanie's 9 curated reference
+# recipes; all-fruit mean/median = over all 3,981 recipes; per-fruit mean/median = over recipes of
+# the same fruit (Rezepturbezeichnung), with an all-fruit fallback for sparse fruits.
+KEY_METHODS_EXPLANATION = [
+    {"Method": "MS Z-Score",
+     "Formula": "z = amount / AvgMeli;  score[c] = Σ z × weight[CAS][c];  predict = argmax",
+     "Explanation & Idea behind it": "Champion baseline. Divide each ingredient's amount by its typical dosage (AvgMeli = mean over Melanie's 9 curated strawberry reference recipes), multiply by the expert cluster weights, pick the top-scoring cluster. Idea: a recipe belongs to the cluster whose signature ingredients it over-uses relative to normal.",
+     "Example": "A recipe with 3× the usual Furaneol (a 'warm' marker) gets a high warm z-score → predicted warm."},
+
+    {"Method": "Z-Score mean (all fruits)",
+     "Formula": "z = amount / mean_all_fruits(amount when present)",
+     "Explanation & Idea behind it": "Same as MS Z-Score but the typical amount is the MEAN over all 3,981 recipes (all fruit types) instead of Melanie's 9 reference recipes. Idea: derive 'typical' from the whole dataset. Worse in practice — the all-fruit average is noisier.",
+     "Example": "Furaneol's typical amount is averaged across strawberry, apple, cherry… diluting its strawberry signature."},
+    {"Method": "Z-Score (per-fruit mean)",
+     "Formula": "z = amount / mean_same_fruit(amount when present)",
+     "Explanation & Idea behind it": "Same as Z-Score mean but the mean is computed WITHIN each recipe's own fruit type (all-fruit fallback for sparse fruits). Idea: judge 'unusually much' against that fruit's own norms, not a blended average.",
+     "Example": "For a strawberry recipe, Furaneol's typical amount is the mean over strawberry recipes only."},
+
+    {"Method": "Z-Score median (all fruits)",
+     "Formula": "z = amount / median_all_fruits(amount when present)",
+     "Explanation & Idea behind it": "Same as Z-Score mean but uses the MEDIAN (robust to outlier recipes) over all fruits.",
+     "Example": "A few recipes dosing Furaneol very high no longer inflate its 'typical' amount."},
+    {"Method": "Z-Score (per-fruit median)",
+     "Formula": "z = amount / median_same_fruit(amount when present)",
+     "Explanation & Idea behind it": "Same but over each recipe's own fruit (robust + fruit-specific). Best of the data-derived denominators on the strawberry test.",
+     "Example": "Strawberry-only median of Furaneol as the denominator for a strawberry recipe."},
+
+    {"Method": "Odor-gate",
+     "Formula": "w'[CAS][c] = weight[CAS][c] if c matches the ingredient's odor type else 0;  z = amount / AvgMeli;  score[c] = Σ z × w'[CAS][c]",
+     "Explanation & Idea behind it": "MS Z-Score, but before scoring, zero any ingredient→cluster weight whose cluster disagrees with the ingredient's odor type (Odour-Type 1/2/3, union). Idea: an ingredient should only vote for clusters it actually smells like. Best method overall (70.6 / 55.0).",
+     "Example": "2-Methylbuttersäure (odor fruity/unpleasant/dairy) keeps its unpleasant & citrus weights, loses warm & exotic."},
+    {"Method": "Odor-gate (per-fruit mean)",
+     "Formula": "same odor gate, z = amount / mean_same_fruit",
+     "Explanation & Idea behind it": "The odor-gate but the z-score denominator is the per-fruit MEAN instead of Melanie's AvgMeli. Its non-per-fruit variant is 'Odor-gate' above (AvgMeli).",
+     "Example": "Strawberry recipe scored with strawberry-mean z, then odor-gated weights."},
+    {"Method": "Odor-gate (per-fruit median)",
+     "Formula": "same odor gate, z = amount / median_same_fruit",
+     "Explanation & Idea behind it": "Same as Odor-gate (per-fruit mean) but with the per-fruit MEDIAN denominator (robust).",
+     "Example": "Strawberry-only median z with odor-gated weights."},
+
+    {"Method": "inv-threshold a=0.25",
+     "Formula": "z = amount / AvgMeli;  f = (median_threshold / threshold)^0.25;  score[c] = Σ z × f × weight[CAS][c]",
+     "Explanation & Idea behind it": "MS Z-Score with each ingredient additionally weighted by potency — the fourth root of inverse odor threshold (low threshold ppm = potent). α=0.25 is a gentle nudge; it ties the champion, stronger α hurts (potency is already in the weights).",
+     "Example": "A very potent trace ester (tiny threshold) gets a mild boost toward its cluster."},
+    {"Method": "inv-threshold a=0.25 (per-fruit mean)",
+     "Formula": "z = amount / mean_same_fruit;  f = (median_threshold / threshold)^0.25",
+     "Explanation & Idea behind it": "Same potency weighting but the z-score denominator is the per-fruit MEAN. Non-per-fruit variant: 'inv-threshold a=0.25' (AvgMeli).",
+     "Example": "Per-fruit-mean z, then multiplied by the fourth-root potency factor."},
+    {"Method": "inv-threshold a=0.25 (per-fruit median)",
+     "Formula": "z = amount / median_same_fruit;  f = (median_threshold / threshold)^0.25",
+     "Explanation & Idea behind it": "Same but per-fruit MEDIAN denominator. Among the strongest per-fruit variants (ties champion on M1, edges it on M2).",
+     "Example": "Per-fruit-median z × potency factor."},
+
+    {"Method": "Odor-gate + inv-threshold a=0.25",
+     "Formula": "odor-gated weights w' + potency f=(median_threshold/threshold)^0.25;  z = amount / AvgMeli",
+     "Explanation & Idea behind it": "Combine the odor-gate (weights pruned by odor type) with the α=0.25 potency weighting.",
+     "Example": "Odor-gated weights, ingredient contributions scaled by the fourth-root potency factor."},
+    {"Method": "Odor-gate + inv-threshold a=0.25 (per-fruit mean)",
+     "Formula": "same, z = amount / mean_same_fruit",
+     "Explanation & Idea behind it": "Same as above but per-fruit MEAN z-denominator. Non-per-fruit variant: 'Odor-gate + inv-threshold a=0.25'.",
+     "Example": "Per-fruit-mean z, odor-gated weights, α=0.25 potency."},
+    {"Method": "Odor-gate + inv-threshold a=0.25 (per-fruit median)",
+     "Formula": "same, z = amount / median_same_fruit",
+     "Explanation & Idea behind it": "Same but per-fruit MEDIAN. Ties the champion on M1 and edges it on M2 (64.7 / 55.0).",
+     "Example": "Per-fruit-median z, odor-gated weights, α=0.25 potency."},
+
+    {"Method": "Odor-gate + inv-threshold a=0.5",
+     "Formula": "odor-gated weights w' + potency f=(median_threshold/threshold)^0.5;  z = amount / AvgMeli",
+     "Explanation & Idea behind it": "Same as the α=0.25 combination but stronger potency weighting (square root instead of fourth root).",
+     "Example": "Odor-gated weights, contributions scaled by the square-root potency factor."},
+    {"Method": "Odor-gate + inv-threshold a=0.5 (per-fruit mean)",
+     "Formula": "same, z = amount / mean_same_fruit",
+     "Explanation & Idea behind it": "Same but per-fruit MEAN z-denominator. Non-per-fruit variant: 'Odor-gate + inv-threshold a=0.5'.",
+     "Example": "Per-fruit-mean z, odor-gated weights, α=0.5 potency."},
+    {"Method": "Odor-gate + inv-threshold a=0.5 (per-fruit median)",
+     "Formula": "same, z = amount / median_same_fruit",
+     "Explanation & Idea behind it": "Same but per-fruit MEDIAN z-denominator.",
+     "Example": "Per-fruit-median z, odor-gated weights, α=0.5 potency."},
+]
 IGNORE_PATH = GOLD / "ignone_substances.csv"
 VERK_XLSX = GOLD / "Ergebnisse Verkostung 25_06_2026.xlsx"
 OUT_XLSX = ROOT / "outputs" / "verkostung_eval_25_06_2026.xlsx"
@@ -404,6 +489,8 @@ def main() -> None:
 
     OUT_XLSX.parent.mkdir(exist_ok=True)
     with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+        pd.DataFrame(KEY_METHODS_EXPLANATION).to_excel(
+            writer, sheet_name="key_Methods_Explanation", index=False)
         acc_m1.to_excel(writer, sheet_name="Accuracy_vs_M1", index=False)
         acc_m2.to_excel(writer, sheet_name="Accuracy_vs_M2", index=False)
         subset_df.to_excel(writer, sheet_name="Subset_Predictions", index=False)
